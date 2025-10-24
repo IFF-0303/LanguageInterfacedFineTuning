@@ -6,7 +6,8 @@ from typing import Any, Dict, Iterable, List, Optional
 import numpy as np
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+import torch.distributed as dist
+from torch.utils.data import DataLoader, Dataset, Sampler, distributed
 from tqdm import tqdm
 
 import transformers
@@ -148,9 +149,25 @@ class LoRaQGPTJ:
         model_provider: str = "huggingface",
     ) -> None:
         self.model_name = model_name
-        self.device = device or (
-            torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-        )
+        self._world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self._global_rank = int(os.environ.get("RANK", "0"))
+        self._local_rank = int(os.environ.get("LOCAL_RANK", str(self._global_rank)))
+        self._distributed = False
+
+        if torch.cuda.is_available():
+            if self._world_size > 1:
+                if not dist.is_available():
+                    raise RuntimeError("torch.distributed is required for multi-GPU fine-tuning.")
+                if not dist.is_initialized():
+                    dist.init_process_group(backend="nccl")
+                self._distributed = True
+                torch.cuda.set_device(self._local_rank)
+                self.device = torch.device(f"cuda:{self._local_rank}")
+            else:
+                self.device = device or torch.device("cuda:0")
+        else:
+            self.device = torch.device("cpu")
+        self._is_main_process = not self._distributed or self._global_rank == 0
         self.model_path = model_path
         self.use_lora = adapter
         self.cache_dir = cache_dir
@@ -188,16 +205,16 @@ class LoRaQGPTJ:
                 bnb_4bit_quant_type="nf4",
             )
 
-        self.model = self._load_model(model_name, quant_config)
+        base_model = self._load_model(model_name, quant_config)
 
         if quant_config is None:
-            self.model = self.model.to(self.device)
+            base_model = base_model.to(self.device)
 
-        self.model.config.use_cache = False
+        base_model.config.use_cache = False
 
         if adapter:
             if quant_config is not None:
-                self.model = prepare_model_for_kbit_training(self.model)
+                base_model = prepare_model_for_kbit_training(base_model)
 
             lora_cfg = lora_config or LoRaConfigParams()
             target_modules = lora_cfg.target_modules or self._default_target_modules()
@@ -208,12 +225,14 @@ class LoRaQGPTJ:
                 task_type="CAUSAL_LM",
                 target_modules=target_modules,
             )
-            self.model = get_peft_model(self.model, config)
+            base_model = get_peft_model(base_model, config)
         else:
-            self.model = self.model.to(self.device)
+            base_model = base_model.to(self.device)
 
         if not load_in_4bit:
-            self.model = self.model.to(self.device)
+            base_model = base_model.to(self.device)
+
+        self.model = self._wrap_model(base_model)
 
     def _default_target_modules(self) -> List[str]:
         return [
@@ -229,10 +248,11 @@ class LoRaQGPTJ:
     def load_networks(self, model_path: str) -> None:
         if self.use_lora:
             base_model = self._load_model(self.model_name)
-            self.model = PeftModel.from_pretrained(base_model, model_path)
+            model = PeftModel.from_pretrained(base_model, model_path)
         else:
-            self.model = self._load_model(model_path)
-        self.model.to(self.device)
+            model = self._load_model(model_path)
+        model = model.to(self.device)
+        self.model = self._wrap_model(model)
 
     def _load_tokenizer(self, identifier: str):
         if self.model_provider == "modelscope":
@@ -271,6 +291,31 @@ class LoRaQGPTJ:
             quantization_config=quant_config,
             torch_dtype=torch.float16 if quant_config is not None else None,
         )
+
+    def _wrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
+        """Wrap the base model to utilise all visible GPUs on a single machine."""
+
+        if self._distributed:
+            return torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[self._local_rank],
+                output_device=self._local_rank,
+                find_unused_parameters=False,
+            )
+        return model
+
+    def _unwrap_model(self) -> torch.nn.Module:
+        """Return the underlying model regardless of any wrappers."""
+
+        return self.model.module if hasattr(self.model, "module") else self.model
+
+    @property
+    def is_main_process(self) -> bool:
+        return self._is_main_process
+
+    @property
+    def is_distributed(self) -> bool:
+        return self._distributed
 
     def prepare_data(self, jsonl_path):
         with open(jsonl_path, "r", encoding="utf-8") as json_file:
@@ -311,8 +356,25 @@ class LoRaQGPTJ:
     ):
         train_data = self.prepare_data(train_jsonl_path)
         val_data = self.prepare_data(val_jsonl_path)
-        data_loader = DataLoader(train_data, batch_size=train_configs['batch_size'], shuffle=True)
-        val_loader = DataLoader(val_data, batch_size=train_configs['batch_size'])
+
+        train_sampler: Optional[Sampler] = None
+        val_sampler: Optional[Sampler] = None
+        if self._distributed:
+            train_sampler = distributed.DistributedSampler(train_data, shuffle=True)
+            val_sampler = distributed.DistributedSampler(val_data, shuffle=False)
+
+        data_loader = DataLoader(
+            train_data,
+            batch_size=train_configs['batch_size'],
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+        )
+        val_loader = DataLoader(
+            val_data,
+            batch_size=train_configs['batch_size'],
+            shuffle=False,
+            sampler=val_sampler,
+        )
         total_steps = len(data_loader) * train_configs['epochs']
 
         self.model.train()
@@ -330,8 +392,16 @@ class LoRaQGPTJ:
         # with torch.cuda.amp.autocast():
         train_losses, val_losses = np.zeros(train_configs['epochs']), np.zeros(train_configs['epochs'])
         for epoch in range(train_configs['epochs']):
-            # self.model.train()
-            tqdm_object = tqdm(data_loader, total=len(data_loader), desc=f"Epoch: {epoch + 1}")
+            if self._distributed and train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+
+            self.model.train()
+            tqdm_object = tqdm(
+                data_loader,
+                total=len(data_loader),
+                desc=f"Epoch: {epoch + 1}",
+                disable=not self._is_main_process,
+            )
             loss_meter = AverageMeter()
             for batch in tqdm_object:
                 self.model.zero_grad(set_to_none=True)
@@ -350,17 +420,28 @@ class LoRaQGPTJ:
                 scheduler.step()
 
                 loss_meter.update(loss.detach().item(), batch[0].shape[0])
-                tqdm_object.set_postfix(train_loss=loss_meter.avg)
+                if self._is_main_process:
+                    tqdm_object.set_postfix(train_loss=loss_meter.avg)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
+            train_stats = torch.tensor(
+                [loss_meter.sum, loss_meter.count],
+                device=self.device,
+                dtype=torch.float64,
+            )
+            if self._distributed:
+                dist.all_reduce(train_stats, op=dist.ReduceOp.SUM)
+            global_train_loss = (train_stats[0] / train_stats[1]).item()
+
             val_loss = self.validate(val_loader)
             val_losses[epoch] = val_loss
-            train_losses[epoch] = loss_meter.avg
+            train_losses[epoch] = global_train_loss
             if saving_checkpoint and val_loss < best_loss:
-                print('Saving the best model with loss {:.4f}'.format(val_loss))
+                if self._is_main_process:
+                    print('Saving the best model with loss {:.4f}'.format(val_loss))
+                    self.save_networks(self.model_path)
                 best_loss = val_loss
-                self.save_networks(self.model_path)
         return train_losses, val_losses
                 
         
@@ -372,7 +453,12 @@ class LoRaQGPTJ:
         self.model.eval()
         # Evaluate data for one epoch
         loss_meter = AverageMeter()
-        tqdm_object = tqdm(val_loader, total=len(val_loader), desc='Validation')
+        tqdm_object = tqdm(
+            val_loader,
+            total=len(val_loader),
+            desc='Validation',
+            disable=not self._is_main_process,
+        )
         for batch in tqdm_object:
             with torch.no_grad():
                 outputs = self.model(
@@ -383,12 +469,22 @@ class LoRaQGPTJ:
                 loss = outputs.loss
 
             loss_meter.update(loss.detach().item(), batch[0].shape[0])
-            tqdm_object.set_postfix(val_loss=loss_meter.avg)
+            if self._is_main_process:
+                tqdm_object.set_postfix(val_loss=loss_meter.avg)
 
-        return loss_meter.avg
+        val_stats = torch.tensor(
+            [loss_meter.sum, loss_meter.count],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        if self._distributed:
+            dist.all_reduce(val_stats, op=dist.ReduceOp.SUM)
+        return (val_stats[0] / val_stats[1]).item()
 
     def generate(self, text_lst, deterministic=True, max_token=10, batch_size=10, temperature: float = 1.0):
         self.model.eval()
+        if self._distributed and not self._is_main_process:
+            return []
         outputs: List[str] = []
         for i in np.arange(0, len(text_lst), batch_size):
             texts = text_lst[i:min(i + batch_size, len(text_lst))]
@@ -407,7 +503,9 @@ class LoRaQGPTJ:
                 early_stopping=True,
                 temperature=temperature,
             )
-            sequences = self.model.generate(**prompt, **generation_kwargs)
+            model = self._unwrap_model()
+            model.eval()
+            sequences = model.generate(**prompt, **generation_kwargs)
             input_lengths = prompt["attention_mask"].sum(dim=1)
             for seq, length in zip(sequences, input_lengths):
                 generated = seq[int(length):]
@@ -422,12 +520,19 @@ class LoRaQGPTJ:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
+        if self._distributed and not self._is_main_process:
+            dist.barrier()
+            return
+
         print("Saving model to %s" % output_dir)
         # Save a trained model, configuration and tokenizer using `save_pretrained()`.
         # They can then be reloaded using `from_pretrained()`
-        model_to_save = self.model.module if hasattr(self.model, 'module') else self.model  # Take care of distributed/parallel training
+        model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
         model_to_save.save_pretrained(output_dir)
         self.tokenizer.save_pretrained(output_dir)
+
+        if self._distributed:
+            dist.barrier()
 
 
 def test(texts, previous_token, end_token):

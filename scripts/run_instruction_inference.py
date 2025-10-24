@@ -135,6 +135,9 @@ def main() -> None:
         temperature=args.temperature,
     )
 
+    if model.is_distributed and not model.is_main_process:
+        return
+
     results: List[Dict[str, Any]] = []
     for example, prediction in zip(examples, generations):
         result = dict(example)

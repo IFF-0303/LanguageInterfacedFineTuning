@@ -1,7 +1,7 @@
 import os
 import json
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 
@@ -60,6 +60,23 @@ class AverageMeter(object):
             self.avg = self.sum / self.count
 
 
+def build_instruction_prompt(example: Dict[str, Any]) -> str:
+    """Construct a standard prompt from an instruction-style example."""
+
+    instruction = example.get("instruction") or example.get("prompt")
+    inp = example.get("input") or example.get("context")
+
+    prompt_sections: List[str] = []
+    if instruction:
+        prompt_sections.append(f"Instruction:\n{str(instruction).strip()}")
+    if inp:
+        prompt_sections.append(f"Input:\n{str(inp).strip()}")
+
+    if prompt_sections:
+        return "\n\n".join(prompt_sections) + "\n\nResponse:"
+    return "Response:"
+
+
 class GPTJDataset(Dataset):
     """Generic dataset wrapper for instruction-style JSONL data."""
 
@@ -67,10 +84,22 @@ class GPTJDataset(Dataset):
         texts: List[str] = []
         completion_lens: List[int] = []
         for row in json_lst:
-            completion = row.get("completion", "")
-            t = " ".join(row.values())
-            texts.append(t)
-            completion_lens.append(len(tokenizer.tokenize(completion)))
+            completion = row.get("completion") or row.get("output") or row.get("response")
+            if completion is None:
+                raise ValueError(
+                    "Each training example must include a 'completion', 'output', or 'response' field."
+                )
+
+            prompt_text = build_instruction_prompt(row)
+            text = f"{prompt_text} {completion}".strip()
+            texts.append(text)
+
+            completion_ids = tokenizer(
+                str(completion),
+                add_special_tokens=False,
+                return_tensors="pt",
+            )["input_ids"]
+            completion_lens.append(int(completion_ids.shape[-1]))
 
         tokens = tokenizer(
             texts,
@@ -244,13 +273,30 @@ class LoRaQGPTJ:
         )
 
     def prepare_data(self, jsonl_path):
-        with open(jsonl_path, 'r') as json_file:
-            json_lst = list(json_file)
+        with open(jsonl_path, "r", encoding="utf-8") as json_file:
+            raw_content = json_file.read().strip()
 
-        txt_list = []
-        for json_str in json_lst:
-            result = json.loads(json_str)
-            txt_list.append(result)
+        if not raw_content:
+            raise ValueError(f"Dataset file '{jsonl_path}' is empty.")
+
+        txt_list: List[dict]
+        try:
+            # Try jsonlines first
+            txt_list = [json.loads(line) for line in raw_content.splitlines() if line.strip()]
+        except json.JSONDecodeError:
+            parsed = json.loads(raw_content)
+            if isinstance(parsed, dict):
+                txt_list = [parsed]
+            elif isinstance(parsed, list):
+                txt_list = parsed
+            else:
+                raise ValueError(
+                    "Unsupported dataset format: expected a JSON object, list, or JSONL entries."
+                )
+
+        for row in txt_list:
+            if "completion" not in row and "output" in row:
+                row["completion"] = row["output"]
 
         data = GPTJDataset(txt_list, self.tokenizer)
 
@@ -361,9 +407,12 @@ class LoRaQGPTJ:
                 early_stopping=True,
                 temperature=temperature,
             )
-            outs = self.model.generate(**prompt, **generation_kwargs)
-            outs = self.tokenizer.batch_decode(outs, skip_special_tokens=True)
-            outputs += outs
+            sequences = self.model.generate(**prompt, **generation_kwargs)
+            input_lengths = prompt["attention_mask"].sum(dim=1)
+            for seq, length in zip(sequences, input_lengths):
+                generated = seq[int(length):]
+                text = self.tokenizer.decode(generated, skip_special_tokens=True)
+                outputs.append(text.strip())
         return outputs
 
 

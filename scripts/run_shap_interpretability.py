@@ -12,6 +12,8 @@ import numpy as np
 import shap
 import torch
 
+from scripts.shap_text_utils import normalise_text_explanations
+
 from src.lift.models.gptj.feature_extractor_classifier import (
     ClassifierHeadConfig,
     LLMFeatureExtractorClassifier,
@@ -190,23 +192,22 @@ def main() -> None:
         batch_size=args.batch_size,
     )
 
-    values = shap_values.values
-    data = shap_values.data
+    values_array, tokens_per_example = normalise_text_explanations(
+        shap_values.values, shap_values.data
+    )
 
     print("Generated SHAP explanations for the following examples:\n")
     for idx, pred_idx in enumerate(pred_ids, start=1):
         print(f"Example {idx}: predicted label = {model.id2label[pred_idx]}")
-        tokens = data[idx - 1]
-        if isinstance(tokens, np.ndarray):
-            tokens = tokens.tolist()
-        token_scores: np.ndarray
-        if values.ndim == 3:
-            token_scores = values[idx - 1, pred_idx]
-        elif values.ndim == 2:
-            token_scores = values[idx - 1]
+        tokens = list(tokens_per_example[idx - 1])
+        if values_array.ndim == 3:
+            token_scores = values_array[idx - 1, pred_idx]
+        elif values_array.ndim == 2:
+            token_scores = values_array[idx - 1]
         else:
             raise RuntimeError(
-                f"Unexpected SHAP values shape {values.shape}; expected rank 2 or 3 for text explanations."
+                "Unexpected SHAP values rank after normalisation; expected 2 or 3 dimensions, "
+                f"got {values_array.ndim}."
             )
         scores = list(zip(tokens, token_scores))
         scores.sort(key=lambda item: abs(float(item[1])), reverse=True)

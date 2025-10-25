@@ -12,6 +12,8 @@ import numpy as np
 import shap
 import torch
 
+from scripts.shap_text_utils import normalise_text_explanations
+
 from src.lift.models.gptj.feature_extractor_classifier import (
     ClassifierHeadConfig,
     LLMFeatureExtractorClassifier,
@@ -165,28 +167,29 @@ def summarise_shap(
     label_names: Sequence[str],
     top_k: int,
 ) -> List[Dict[str, Any]]:
-    values = shap_values.values
-    tokens_data = shap_values.data
+    values_array, tokens_per_example = normalise_text_explanations(
+        shap_values.values, shap_values.data
+    )
 
     summaries: List[Dict[str, Any]] = []
-    for idx in range(values.shape[0]):
-        entry: Dict[str, Any] = {"tokens": list(tokens_data[idx])}
+    for idx, token_sequence in enumerate(tokens_per_example):
+        entry: Dict[str, Any] = {"tokens": list(token_sequence)}
         per_label: Dict[str, List[Dict[str, float]]] = {}
-        if values.ndim == 3:
+        if values_array.ndim == 3:
             for label_idx, label in enumerate(label_names):
-                token_scores = values[idx, label_idx]
+                token_scores = values_array[idx, label_idx]
                 ranked = sorted(
-                    zip(tokens_data[idx], token_scores),
+                    zip(token_sequence, token_scores),
                     key=lambda item: abs(float(item[1])),
                     reverse=True,
                 )
                 per_label[label] = [
                     {"token": token, "score": float(score)} for token, score in ranked[:top_k]
                 ]
-        elif values.ndim == 2:
-            token_scores = values[idx]
+        elif values_array.ndim == 2:
+            token_scores = values_array[idx]
             ranked = sorted(
-                zip(tokens_data[idx], token_scores),
+                zip(token_sequence, token_scores),
                 key=lambda item: abs(float(item[1])),
                 reverse=True,
             )
@@ -195,7 +198,8 @@ def summarise_shap(
             ]
         else:
             raise RuntimeError(
-                f"Unexpected SHAP values shape {values.shape}; expected rank 2 or 3 for text explanations."
+                "Unexpected SHAP values rank after normalisation; expected 2 or 3 dimensions, "
+                f"got {values_array.ndim}."
             )
 
         entry["top_tokens"] = per_label

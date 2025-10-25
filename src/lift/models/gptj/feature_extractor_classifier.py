@@ -252,18 +252,25 @@ class LLMFeatureExtractorClassifier(nn.Module, LoRaQGPTJ):
                 outputs = runner(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    output_hidden_states=False,
+                    output_hidden_states=True,
                     return_dict=True,
                 )
         else:
             outputs = runner(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                output_hidden_states=False,
+                output_hidden_states=True,
                 return_dict=True,
             )
 
-        last_hidden = outputs.last_hidden_state  # (batch, seq_len, hidden)
+        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+            last_hidden = outputs.last_hidden_state
+        elif getattr(outputs, "hidden_states", None):
+            last_hidden = outputs.hidden_states[-1]
+        else:
+            raise AttributeError(
+                "Backbone output must provide `last_hidden_state` or `hidden_states` when `output_hidden_states=True`."
+            )
         mask = attention_mask.unsqueeze(-1)
         masked_sum = (last_hidden * mask).sum(dim=1)
         lengths = mask.sum(dim=1).clamp(min=1)

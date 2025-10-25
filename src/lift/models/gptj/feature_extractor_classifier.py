@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import torch
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Dataset
 
 from .lora_gptj import LoRaQGPTJ, build_instruction_prompt
@@ -103,7 +104,7 @@ class InstructionClassificationDataset(Dataset):
         return self.input_ids[idx], self.attention_mask[idx]
 
 
-class LLMFeatureExtractorClassifier(LoRaQGPTJ):
+class LLMFeatureExtractorClassifier(nn.Module, LoRaQGPTJ):
     """Wraps :class:`LoRaQGPTJ` with a configurable backbone and MLP head."""
 
     classifier_config: ClassifierHeadConfig
@@ -114,9 +115,11 @@ class LLMFeatureExtractorClassifier(LoRaQGPTJ):
         num_labels: int,
         classifier_config: Optional[ClassifierHeadConfig] = None,
         freeze_backbone: bool = True,
+        wrap_backbone_with_ddp: bool = True,
         **kwargs: Any,
     ) -> None:
-        super().__init__(**kwargs)
+        nn.Module.__init__(self)
+        LoRaQGPTJ.__init__(self, wrap_with_ddp=wrap_backbone_with_ddp, **kwargs)
 
         self.classifier_config = classifier_config or ClassifierHeadConfig()
         self.label2id: Dict[str, int] = {}
@@ -124,19 +127,28 @@ class LLMFeatureExtractorClassifier(LoRaQGPTJ):
         self.backbone_frozen: bool = False
         self.backbone_train_mode: str = "frozen"
 
+        self.classifier = self._build_classifier(num_labels)
+        self.classifier.to(self.device)
+
         if freeze_backbone:
             self.freeze_backbone()
         else:
             self.unfreeze_backbone()
 
-        self.classifier = self._build_classifier(num_labels)
-        self.classifier.to(self.device)
+    def _backbone_runner(self) -> torch.nn.Module:
+        """Return the module that should be used for forward passes through the backbone."""
+
+        if isinstance(self.model, DistributedDataParallel):
+            return self.model
+        return self._unwrap_model()
 
     def freeze_backbone(self) -> None:
         """Ensure the underlying language model is used as a frozen feature extractor."""
 
         backbone = self._unwrap_model()
         backbone.eval()
+        if isinstance(self.model, DistributedDataParallel):
+            self.model.eval()
         for param in backbone.parameters():
             param.requires_grad_(False)
         self.backbone_frozen = True
@@ -147,6 +159,8 @@ class LLMFeatureExtractorClassifier(LoRaQGPTJ):
 
         backbone = self._unwrap_model()
         backbone.train()
+        if isinstance(self.model, DistributedDataParallel):
+            self.model.train()
         for param in backbone.parameters():
             param.requires_grad_(True)
         self.backbone_frozen = False
@@ -174,6 +188,8 @@ class LLMFeatureExtractorClassifier(LoRaQGPTJ):
             )
 
         backbone.train()
+        if isinstance(self.model, DistributedDataParallel):
+            self.model.train()
         self.backbone_frozen = False
         self.backbone_train_mode = "lora"
 
@@ -226,18 +242,21 @@ class LLMFeatureExtractorClassifier(LoRaQGPTJ):
     def extract_features(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Run the backbone and return pooled token representations."""
 
+        runner = self._backbone_runner()
         backbone = self._unwrap_model()
         if self.backbone_frozen:
             backbone.eval()
+            if isinstance(runner, DistributedDataParallel):
+                runner.eval()
             with torch.no_grad():
-                outputs = backbone(
+                outputs = runner(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     output_hidden_states=False,
                     return_dict=True,
                 )
         else:
-            outputs = backbone(
+            outputs = runner(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 output_hidden_states=False,

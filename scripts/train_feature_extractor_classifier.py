@@ -5,11 +5,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Tuple
 
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
 from src.lift.models.gptj.feature_extractor_classifier import (
@@ -156,49 +160,115 @@ def build_label_mapping(examples: Iterable[Dict[str, Any]], label_field: str | N
     return {label: idx for idx, label in enumerate(unique)}
 
 
+def is_distributed() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
 def evaluate(
     model: LLMFeatureExtractorClassifier,
+    forward_module: torch.nn.Module,
     dataloader: DataLoader,
     loss_fn: torch.nn.Module,
+    distributed: bool,
 ) -> Dict[str, float]:
+    """Evaluate the model on a validation dataloader and return aggregate metrics."""
+
     model.eval()
-    total_loss = 0.0
-    correct = 0
-    total = 0
+    forward_module.eval()
+
+    loss_total = torch.zeros((), dtype=torch.float64, device=model.device)
+    correct_total = torch.zeros((), dtype=torch.float64, device=model.device)
+    samples_total = torch.zeros((), dtype=torch.float64, device=model.device)
 
     for batch in dataloader:
-        input_ids = batch[0].to(model.device)
-        attention_mask = batch[1].to(model.device)
-        labels = batch[2].to(model.device)
+        input_ids = batch[0].to(model.device, non_blocking=True)
+        attention_mask = batch[1].to(model.device, non_blocking=True)
+        labels = batch[2].to(model.device, non_blocking=True)
 
         with torch.no_grad():
-            logits = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = forward_module(input_ids=input_ids, attention_mask=attention_mask)
             loss = loss_fn(logits, labels)
 
         preds = torch.argmax(logits, dim=-1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-        total_loss += loss.detach().item() * labels.size(0)
+        correct_total += (preds == labels).sum().to(torch.float64)
+        samples_total += labels.size(0)
+        loss_total += loss.detach().to(torch.float64) * labels.size(0)
 
+    stats = torch.stack([loss_total, correct_total, samples_total])
+    if distributed:
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+    total_loss, correct, total = stats.tolist()
     return {
-        "loss": total_loss / max(total, 1),
-        "accuracy": correct / max(total, 1),
+        "loss": total_loss / max(total, 1.0),
+        "accuracy": correct / max(total, 1.0),
     }
 
 
-def main() -> None:
-    args = parse_args()
+def setup_distributed(rank: int, world_size: int) -> None:
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "10086")
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
 
-    train_examples = load_examples(args.train_file)
-    val_examples = load_examples(args.val_file)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
-    label2id = build_label_mapping(train_examples, args.label_field)
 
-    if args.train_backbone and args.train_lora:
-        raise ValueError("--train-backbone and --train-lora are mutually exclusive options.")
+def cleanup_distributed() -> None:
+    if is_distributed():
+        dist.destroy_process_group()
 
-    if args.train_lora and args.no_adapter:
-        raise ValueError("--train-lora requires LoRA adapters. Remove --no-adapter to enable them.")
+
+def build_dataloaders(
+    train_dataset: InstructionClassificationDataset,
+    val_dataset: InstructionClassificationDataset,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+) -> Tuple[DataLoader, DataLoader, DistributedSampler | None]:
+    train_sampler: DistributedSampler | None = None
+    val_sampler: DistributedSampler | None = None
+
+    if world_size > 1:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+        )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=val_sampler,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+    )
+    return train_loader, val_loader, train_sampler
+
+
+def instantiate_model(
+    args: argparse.Namespace,
+    label2id: Dict[str, int],
+    distributed: bool,
+) -> LLMFeatureExtractorClassifier:
+    """Create and configure the feature-extractor classifier model."""
 
     head_config = ClassifierHeadConfig(
         hidden_dims=args.hidden_dims or [],
@@ -227,10 +297,12 @@ def main() -> None:
         classifier_config=head_config,
         freeze_backbone=not (args.train_backbone or args.train_lora),
         lora_config=lora_config,
+        wrap_backbone_with_ddp=not distributed,
     )
 
     if args.adapter_path and not args.no_adapter:
         model.load_networks(args.adapter_path)
+
     if args.train_backbone:
         model.unfreeze_backbone()
     elif args.train_lora:
@@ -239,6 +311,67 @@ def main() -> None:
         model.freeze_backbone()
 
     model.set_label_mapping(label2id)
+    return model
+
+
+def build_optimizer(
+    model: LLMFeatureExtractorClassifier,
+    args: argparse.Namespace,
+) -> torch.optim.Optimizer:
+    """Create the AdamW optimizer with separate learning rates when requested."""
+
+    param_groups: List[Dict[str, Any]] = []
+
+    classifier_params = [p for p in model.classifier.parameters() if p.requires_grad]
+    if classifier_params:
+        param_groups.append({"params": classifier_params, "lr": args.learning_rate})
+
+    if args.train_backbone or args.train_lora:
+        backbone_params = list(model.backbone_parameters())
+        if backbone_params:
+            backbone_lr = args.backbone_learning_rate or args.learning_rate
+            param_groups.append({"params": backbone_params, "lr": backbone_lr})
+
+    if not param_groups:
+        raise ValueError(
+            "No trainable parameters were found. Ensure the classifier head or backbone is unfrozen."
+        )
+
+    return torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
+
+
+def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
+    distributed = torch.cuda.is_available() and world_size > 1
+
+    if distributed:
+        setup_distributed(rank, world_size)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
+
+    device = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
+
+    train_examples = load_examples(args.train_file)
+    val_examples = load_examples(args.val_file)
+
+    label2id = build_label_mapping(train_examples, args.label_field)
+
+    if args.train_backbone and args.train_lora:
+        raise ValueError("--train-backbone and --train-lora are mutually exclusive options.")
+
+    if args.train_lora and args.no_adapter:
+        raise ValueError("--train-lora requires LoRA adapters. Remove --no-adapter to enable them.")
+
+    model = instantiate_model(args, label2id, distributed)
+    model.to(device)
+
+    forward_module: torch.nn.Module = model
+    if distributed:
+        forward_module = DistributedDataParallel(
+            model,
+            device_ids=[rank],
+            output_device=rank,
+            find_unused_parameters=False,
+        )
 
     train_dataset = InstructionClassificationDataset(
         train_examples,
@@ -255,27 +388,17 @@ def main() -> None:
         max_length=args.max_length,
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    train_loader, val_loader, train_sampler = build_dataloaders(
+        train_dataset,
+        val_dataset,
+        args.batch_size,
+        rank,
+        world_size,
+    )
 
-    param_groups: List[Dict[str, Any]] = []
-    classifier_params = [p for p in model.classifier.parameters() if p.requires_grad]
-    if classifier_params:
-        param_groups.append({"params": classifier_params, "lr": args.learning_rate})
+    model.device = device
 
-    backbone_params: List[torch.nn.Parameter] = []
-    if args.train_backbone or args.train_lora:
-        backbone_params = list(model.backbone_parameters())
-        if backbone_params:
-            backbone_lr = args.backbone_learning_rate or args.learning_rate
-            param_groups.append({"params": backbone_params, "lr": backbone_lr})
-
-    if not param_groups:
-        raise ValueError(
-            "No trainable parameters were found. Ensure the classifier head or backbone is unfrozen."
-        )
-
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
+    optimizer = build_optimizer(model, args)
 
     total_steps = len(train_loader) * max(args.epochs, 1)
     scheduler = None
@@ -291,64 +414,98 @@ def main() -> None:
     loss_fn = torch.nn.CrossEntropyLoss()
 
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    is_main_process = rank == 0
+    if is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     best_metrics = {"loss": float("inf"), "accuracy": 0.0}
-    best_state: Dict[str, Any] | None = None
-    backbone_dir: Path | None = None
-    backbone_saved = False
-    if args.train_backbone or args.train_lora:
-        backbone_dir = output_dir / "backbone"
+    best_classifier: Dict[str, Any] | None = None
+    backbone_dir: Path | None = output_dir / "backbone" if (args.train_backbone or args.train_lora) else None
 
     for epoch in range(args.epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        forward_module.train()
         model.train()
-        model.classifier.train()
-        progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
+
+        progress = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch + 1}/{args.epochs}",
+            disable=not is_main_process,
+        )
 
         for batch in progress:
-            input_ids = batch[0].to(model.device)
-            attention_mask = batch[1].to(model.device)
-            labels = batch[2].to(model.device)
+            input_ids = batch[0].to(model.device, non_blocking=True)
+            attention_mask = batch[1].to(model.device, non_blocking=True)
+            labels = batch[2].to(model.device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            logits = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = forward_module(input_ids=input_ids, attention_mask=attention_mask)
             loss = loss_fn(logits, labels)
             loss.backward()
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
 
-            progress.set_postfix(loss=loss.detach().item())
+            if is_main_process:
+                progress.set_postfix(loss=loss.detach().item())
 
-        metrics = evaluate(model, val_loader, loss_fn)
-        print(
-            f"Epoch {epoch + 1}: val_loss={metrics['loss']:.4f}, val_accuracy={metrics['accuracy']:.4f}"
-        )
+        metrics = evaluate(model, forward_module, val_loader, loss_fn, distributed)
+        if is_main_process:
+            print(
+                f"Epoch {epoch + 1}: val_loss={metrics['loss']:.4f}, val_accuracy={metrics['accuracy']:.4f}"
+            )
 
-        if metrics["accuracy"] >= best_metrics["accuracy"]:
+        if is_main_process and metrics["accuracy"] >= best_metrics["accuracy"]:
             best_metrics = metrics
-            best_state = {
-                "classifier": {k: v.cpu() for k, v in model.classifier.state_dict().items()},
-                "label2id": model.label2id,
-                "metadata": metrics,
+            best_classifier = {
+                "state": {k: v.cpu() for k, v in model.classifier.state_dict().items()},
+                "label2id": dict(model.label2id),
             }
-            if (args.train_backbone or args.train_lora) and backbone_dir is not None:
+            if backbone_dir is not None:
                 model.save_networks(str(backbone_dir))
-                backbone_saved = True
 
-    if best_state is not None:
-        model.classifier.load_state_dict(best_state["classifier"])
-        model.set_label_mapping(best_state["label2id"])
+    if is_main_process and best_classifier is None:
+        best_classifier = {
+            "state": {k: v.cpu() for k, v in model.classifier.state_dict().items()},
+            "label2id": dict(model.label2id),
+        }
 
-    if (args.train_backbone or args.train_lora) and backbone_dir is not None and not backbone_saved:
+    if is_main_process and best_classifier is not None:
+        model.classifier.load_state_dict(best_classifier["state"])
+        model.set_label_mapping(best_classifier["label2id"])
+
+    if distributed:
+        cleanup_distributed()
+
+    if not is_main_process:
+        return
+
+    if backbone_dir is not None:
         model.save_networks(str(backbone_dir))
-        backbone_saved = True
 
-    model.save_classifier(output_dir, backbone_dir=backbone_dir if backbone_saved else None)
+    model.save_classifier(output_dir, backbone_dir=backbone_dir)
 
     summary_path = output_dir / "training_metrics.json"
-    summary_path.write_text(json.dumps(best_metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+    summary_path.write_text(
+        json.dumps(best_metrics, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     print("Training complete. Best validation metrics:", best_metrics)
+
+
+def main() -> None:
+    args = parse_args()
+
+    cuda_available = torch.cuda.is_available()
+    world_size = torch.cuda.device_count() if cuda_available else 1
+
+    if world_size <= 1:
+        train(0, world_size, args)
+        return
+
+    mp.spawn(train, args=(world_size, args), nprocs=world_size, join=True)
 
 
 if __name__ == "__main__":

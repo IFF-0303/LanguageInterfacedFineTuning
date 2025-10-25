@@ -147,12 +147,14 @@ class LoRaQGPTJ:
         lora_config: Optional[LoRaConfigParams] = None,
         trust_remote_code: bool = True,
         model_provider: str = "huggingface",
+        wrap_with_ddp: bool = True,
     ) -> None:
         self.model_name = model_name
         self._world_size = int(os.environ.get("WORLD_SIZE", "1"))
         self._global_rank = int(os.environ.get("RANK", "0"))
         self._local_rank = int(os.environ.get("LOCAL_RANK", str(self._global_rank)))
         self._distributed = False
+        self._auto_wrap_with_ddp = wrap_with_ddp
 
         if torch.cuda.is_available():
             if self._world_size > 1:
@@ -295,7 +297,7 @@ class LoRaQGPTJ:
     def _wrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
         """Wrap the base model to utilise all visible GPUs on a single machine."""
 
-        if self._distributed:
+        if self._distributed and self._auto_wrap_with_ddp:
             return torch.nn.parallel.DistributedDataParallel(
                 model,
                 device_ids=[self._local_rank],

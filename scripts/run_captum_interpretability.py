@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
 
@@ -208,6 +209,22 @@ def aggregate_attributions(attributions: torch.Tensor, attention_mask: torch.Ten
     return summed * attention_mask
 
 
+@contextmanager
+def temporarily_enable_backbone_gradients(model: LLMFeatureExtractorClassifier):
+    """Ensure the backbone runs with gradients even if it was initialised as frozen."""
+
+    was_frozen = getattr(model, "backbone_frozen", False)
+    try:
+        if was_frozen:
+            # The flag gates a ``torch.no_grad`` region inside ``extract_features``; toggling
+            # it off avoids silently detaching the backbone activations that Captum needs.
+            model.backbone_frozen = False
+        yield
+    finally:
+        if was_frozen:
+            model.backbone_frozen = True
+
+
 def main() -> None:
     args = parse_args()
 
@@ -242,22 +259,24 @@ def main() -> None:
 
     embedding_layer = model._unwrap_model().get_input_embeddings()
     original_requires_grad = getattr(embedding_layer.weight, "requires_grad", False)
-    if not original_requires_grad:
-        embedding_layer.weight.requires_grad_(True)
 
     def forward_func(ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         return model(input_ids=ids, attention_mask=mask)
 
-    lig = LayerIntegratedGradients(forward_func, embedding_layer)
-    attributions, delta = lig.attribute(
-        inputs=input_ids,
-        baselines=baseline,
-        additional_forward_args=(attention_mask,),
-        target=target_indices,
-        n_steps=args.steps,
-        internal_batch_size=args.internal_batch_size,
-        return_convergence_delta=True,
-    )
+    with temporarily_enable_backbone_gradients(model):
+        if not original_requires_grad:
+            embedding_layer.weight.requires_grad_(True)
+
+        lig = LayerIntegratedGradients(forward_func, embedding_layer)
+        attributions, delta = lig.attribute(
+            inputs=input_ids,
+            baselines=baseline,
+            additional_forward_args=(attention_mask,),
+            target=target_indices,
+            n_steps=args.steps,
+            internal_batch_size=args.internal_batch_size,
+            return_convergence_delta=True,
+        )
 
     if not original_requires_grad:
         embedding_layer.weight.requires_grad_(False)

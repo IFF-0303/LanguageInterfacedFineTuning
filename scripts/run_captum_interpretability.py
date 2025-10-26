@@ -263,30 +263,54 @@ def main() -> None:
     def forward_func(ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         return model(input_ids=ids, attention_mask=mask)
 
+    tokens_per_example = tokens_from_ids(input_ids.detach().cpu(), model.tokenizer)
+    attention_mask_cpu = attention_mask.detach().cpu()
+
+    attribution_results: List[Dict[str, Any]] = []
+
     with temporarily_enable_backbone_gradients(model):
         if not original_requires_grad:
             embedding_layer.weight.requires_grad_(True)
 
         lig = LayerIntegratedGradients(forward_func, embedding_layer)
-        attributions, delta = lig.attribute(
-            inputs=input_ids,
-            baselines=baseline,
-            additional_forward_args=(attention_mask,),
-            target=target_indices,
-            n_steps=args.steps,
-            internal_batch_size=args.internal_batch_size,
-            return_convergence_delta=True,
-        )
+
+        for i in range(num_to_explain):
+            ids_i = input_ids[i : i + 1]
+            mask_i = attention_mask[i : i + 1]
+            baseline_i = baseline[i : i + 1]
+            target_i = target_indices[i]
+
+            attr_i, delta_i = lig.attribute(
+                inputs=ids_i,
+                baselines=baseline_i,
+                additional_forward_args=(mask_i,),
+                target=target_i,
+                n_steps=args.steps,
+                internal_batch_size=args.internal_batch_size,
+                return_convergence_delta=True,
+            )
+
+            aggregated_i = aggregate_attributions(attr_i, mask_i).detach().cpu().squeeze(0)
+            delta_value = (
+                float(delta_i.detach().cpu().item())
+                if isinstance(delta_i, torch.Tensor)
+                else None
+            )
+
+            attribution_results.append(
+                {
+                    "aggregated": aggregated_i,
+                    "delta": delta_value,
+                }
+            )
+
+            # Release tensors tied to the current iteration to free GPU memory eagerly.
+            del attr_i, delta_i
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     if not original_requires_grad:
         embedding_layer.weight.requires_grad_(False)
-
-    aggregated = aggregate_attributions(attributions, attention_mask)
-
-    tokens_per_example = tokens_from_ids(input_ids.detach().cpu(), model.tokenizer)
-    attention_mask_cpu = attention_mask.detach().cpu()
-    aggregated_cpu = aggregated.detach().cpu()
-    delta_cpu = delta.detach().cpu() if isinstance(delta, torch.Tensor) else None
 
     label_names = {idx: label for idx, label in model.id2label.items()}
 
@@ -298,7 +322,7 @@ def main() -> None:
         target_idx = int(target_indices[i])
         tokens_row = tokens_per_example[i]
         mask_row = attention_mask_cpu[i].tolist()
-        scores_row = aggregated_cpu[i].tolist()
+        scores_row = attribution_results[i]["aggregated"].tolist()
 
         scored_tokens = [
             {"token": token, "score": float(score)}
@@ -310,8 +334,9 @@ def main() -> None:
         print(f"Example {i + 1}: predicted label = {label_names.get(pred_idx, pred_idx)}")
         print(f"  Target label explained = {label_names.get(target_idx, target_idx)}")
         print(f"  Predicted probability   = {float(probs[i, pred_idx].item()):.4f}")
-        if delta_cpu is not None:
-            print(f"  Convergence delta       = {float(delta_cpu[i].item()):.6f}")
+        delta_value = attribution_results[i]["delta"]
+        if delta_value is not None:
+            print(f"  Convergence delta       = {delta_value:.6f}")
         print("  Top tokens:")
         for item in scored_tokens[: args.top_k]:
             print(f"    {item['token']!r:>15} : {item['score']:+.4f}")
@@ -324,7 +349,7 @@ def main() -> None:
                 "predicted_label": label_names.get(pred_idx, str(pred_idx)),
                 "target_label": label_names.get(target_idx, str(target_idx)),
                 "predicted_probability": float(probs[i, pred_idx].item()),
-                "convergence_delta": float(delta_cpu[i].item()) if delta_cpu is not None else None,
+                "convergence_delta": delta_value,
                 "token_attributions": scored_tokens,
             }
         )

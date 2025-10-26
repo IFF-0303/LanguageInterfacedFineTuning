@@ -191,6 +191,7 @@ dependencies:
     - bleach==3.3.0
     - codecov==2.1.11
     - coverage==5.5
+    - captum==0.6.0
     - cycler==0.10.0
     - cython==0.28.4
     - dataproperty==0.50.1

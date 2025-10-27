@@ -60,6 +60,13 @@ parser.add_argument("-o", "--openai_key", default='', type=str)
 parser.add_argument("-p", "--epochs", default=10, type=int)
 parser.add_argument("-r","--subset_fraction", default=1, type=float)
 parser.add_argument("-t", "--task", default='accuracy', type=str)
+parser.add_argument(
+    "--class_weight",
+    type=str,
+    default="none",
+    choices=["none", "balanced", "sqrt_inv"],
+    help="Strategy for handling class imbalance during fine-tuning.",
+)
 
 
 args = parser.parse_args()
@@ -79,6 +86,9 @@ if args.in_context:
     CONFIG = {'learning_rate': args.lr, 'batch_size': args.batch_size, 'epochs':[0], 'weight_decay': 0.01, 'warmup_steps': 6}
 else:
     CONFIG = {'learning_rate': args.lr, 'batch_size': args.batch_size, 'epochs':[args.epochs], 'weight_decay': 0.01, 'warmup_steps': 6}
+
+class_weight = None if args.class_weight == "none" else args.class_weight
+CONFIG['class_weight'] = class_weight
 
 if args.in_context or args.subset=='in_context':
     NUM_PROMPTS = cfgs.in_context_num_prompts[args.data_id]

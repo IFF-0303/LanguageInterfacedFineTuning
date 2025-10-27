@@ -59,6 +59,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Specific module names to apply LoRA to (defaults to attention/MLP projections).",
     )
+    parser.add_argument(
+        "--class-weight",
+        choices=["none", "balanced", "sqrt_inv"],
+        default="none",
+        help=(
+            "Strategy for addressing class imbalance. "
+            "Set to 'balanced' to inversely scale by class frequency or 'sqrt_inv' for a milder variant."
+        ),
+    )
     return parser
 
 
@@ -110,6 +119,8 @@ def run_training(rank: int, world_size: int, args: argparse.Namespace) -> None:
             model_provider=args.model_provider,
         )
 
+        class_weight_strategy = None if args.class_weight == "none" else args.class_weight
+
         train_configs = {
             "batch_size": args.batch_size,
             "epochs": args.epochs,
@@ -117,6 +128,8 @@ def run_training(rank: int, world_size: int, args: argparse.Namespace) -> None:
             "weight_decay": args.weight_decay,
             "warmup_steps": args.warmup_steps,
         }
+        if class_weight_strategy:
+            train_configs["class_weight"] = class_weight_strategy
 
         train_losses, val_losses = trainer.finetune(
             args.train_file,

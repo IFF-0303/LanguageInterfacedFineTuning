@@ -7,7 +7,7 @@ import numpy as np
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import DataLoader, Dataset, Sampler, distributed
+from torch.utils.data import DataLoader, Dataset, Sampler, distributed, WeightedRandomSampler
 from tqdm import tqdm
 
 import transformers
@@ -17,6 +17,8 @@ from transformers import (
     BitsAndBytesConfig,
     get_linear_schedule_with_warmup,
 )
+
+from .samplers import DistributedWeightedRandomSampler
 
 try:
     from modelscope import (
@@ -84,6 +86,8 @@ class GPTJDataset(Dataset):
     def __init__(self, json_lst: Iterable[dict], tokenizer, max_length: int = 1024):
         texts: List[str] = []
         completion_lens: List[int] = []
+        label_mapping: Dict[str, int] = {}
+        class_indices: List[int] = []
         for row in json_lst:
             completion = row.get("completion") or row.get("output") or row.get("response")
             if completion is None:
@@ -94,6 +98,11 @@ class GPTJDataset(Dataset):
             prompt_text = build_instruction_prompt(row)
             text = f"{prompt_text} {completion}".strip()
             texts.append(text)
+
+            label_str = str(completion).strip()
+            if label_str not in label_mapping:
+                label_mapping[label_str] = len(label_mapping)
+            class_indices.append(label_mapping[label_str])
 
             completion_ids = tokenizer(
                 str(completion),
@@ -118,11 +127,61 @@ class GPTJDataset(Dataset):
             b_labels[:label_trim] = -100
             self.labels.append(b_labels)
 
+        self.label_mapping = label_mapping
+        self.class_indices = torch.tensor(class_indices, dtype=torch.long)
+        if len(self.class_indices) > 0:
+            self.class_counts = torch.bincount(
+                self.class_indices, minlength=len(self.label_mapping)
+            )
+        else:
+            self.class_counts = torch.tensor([], dtype=torch.long)
+
     def __len__(self) -> int:
         return len(self.labels)
 
     def __getitem__(self, idx: int):
         return self.input_ids[idx], self.attention_mask[idx], self.labels[idx]
+
+    def compute_sample_weights(
+        self,
+        strategy: str = "balanced",
+        smoothing: float = 0.0,
+    ) -> torch.Tensor:
+        """Return per-sample weights for rebalancing imbalanced datasets.
+
+        Parameters
+        ----------
+        strategy:
+            Currently supports ``"balanced"`` which inversely weights by class
+            frequency and ``"sqrt_inv"`` which uses the inverse square root of
+            the class frequency.  Additional strategies can be implemented as
+            needed.
+        smoothing:
+            Optional additive smoothing term that can be used to avoid extreme
+            weights when the minority class has very few samples.
+        """
+
+        if self.class_indices.numel() == 0:
+            raise ValueError("Cannot compute sample weights for an empty dataset.")
+
+        counts = self.class_counts.to(dtype=torch.float32)
+        if smoothing > 0:
+            counts = counts + smoothing
+
+        if torch.any(counts <= 0):
+            raise ValueError("Encountered non-positive class counts when computing weights.")
+
+        if strategy == "balanced":
+            class_weights = 1.0 / counts
+        elif strategy == "sqrt_inv":
+            class_weights = torch.pow(counts, -0.5)
+        else:
+            raise ValueError(f"Unknown class rebalancing strategy: {strategy}")
+
+        sample_weights = class_weights[self.class_indices]
+        # Normalise weights to keep gradients stable (mean of 1.0)
+        sample_weights = sample_weights / sample_weights.mean()
+        return sample_weights
 
 
 @dataclass
@@ -365,10 +424,29 @@ class LoRaQGPTJ:
             train_sampler = distributed.DistributedSampler(train_data, shuffle=True)
             val_sampler = distributed.DistributedSampler(val_data, shuffle=False)
 
+        class_weight_cfg = train_configs.get("class_weight")
+        if class_weight_cfg:
+            sample_weights = train_data.compute_sample_weights(strategy=class_weight_cfg)
+            if self._distributed:
+                train_sampler = DistributedWeightedRandomSampler(
+                    sample_weights,
+                    num_replicas=self._world_size,
+                    rank=self._global_rank,
+                )
+            else:
+                train_sampler = WeightedRandomSampler(
+                    weights=sample_weights,
+                    num_samples=len(sample_weights),
+                    replacement=True,
+                )
+            shuffle_flag = False
+        else:
+            shuffle_flag = train_sampler is None
+
         data_loader = DataLoader(
             train_data,
             batch_size=train_configs['batch_size'],
-            shuffle=train_sampler is None,
+            shuffle=shuffle_flag,
             sampler=train_sampler,
         )
         val_loader = DataLoader(

@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Sampler, WeightedRandomSampler
 from tqdm import tqdm
 
 from src.lift.models.gptj.feature_extractor_classifier import (
@@ -21,6 +21,7 @@ from src.lift.models.gptj.feature_extractor_classifier import (
     InstructionClassificationDataset,
     LLMFeatureExtractorClassifier,
 )
+from src.lift.models.gptj.samplers import DistributedWeightedRandomSampler
 
 
 def parse_args() -> argparse.Namespace:
@@ -108,6 +109,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional explicit field name containing labels. "
             "If not provided the script searches for 'label', 'target', 'answer', 'category', or 'class'."
+        ),
+    )
+    parser.add_argument(
+        "--class-weight",
+        choices=["none", "balanced", "sqrt_inv"],
+        default="none",
+        help=(
+            "Strategy for rebalancing class distributions. "
+            "Set to 'balanced' to inversely scale by class frequency or 'sqrt_inv' for a milder adjustment."
         ),
     )
     return parser.parse_args()
@@ -226,22 +236,40 @@ def build_dataloaders(
     batch_size: int,
     rank: int,
     world_size: int,
-) -> Tuple[DataLoader, DataLoader, DistributedSampler | None]:
-    train_sampler: DistributedSampler | None = None
+    *,
+    class_weight_strategy: str | None = None,
+) -> Tuple[DataLoader, DataLoader, Sampler | None]:
+    train_sampler: Sampler | None = None
     val_sampler: DistributedSampler | None = None
 
     if world_size > 1:
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-        )
         val_sampler = DistributedSampler(
             val_dataset,
             num_replicas=world_size,
             rank=rank,
             shuffle=False,
+        )
+
+    if class_weight_strategy:
+        sample_weights = train_dataset.compute_sample_weights(strategy=class_weight_strategy)
+        if world_size > 1:
+            train_sampler = DistributedWeightedRandomSampler(
+                sample_weights,
+                num_replicas=world_size,
+                rank=rank,
+            )
+        else:
+            train_sampler = WeightedRandomSampler(
+                weights=sample_weights,
+                num_samples=len(sample_weights),
+                replacement=True,
+            )
+    elif world_size > 1:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
         )
 
     train_loader = DataLoader(
@@ -388,12 +416,15 @@ def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
         max_length=args.max_length,
     )
 
+    class_weight_strategy = None if args.class_weight == "none" else args.class_weight
+
     train_loader, val_loader, train_sampler = build_dataloaders(
         train_dataset,
         val_dataset,
         args.batch_size,
         rank,
         world_size,
+        class_weight_strategy=class_weight_strategy,
     )
 
     model.device = device
@@ -411,7 +442,13 @@ def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
             num_training_steps=total_steps,
         )
 
-    loss_fn = torch.nn.CrossEntropyLoss()
+    loss_weights = None
+    if class_weight_strategy:
+        loss_weights = train_dataset.compute_class_weights(strategy=class_weight_strategy)
+
+    loss_fn = torch.nn.CrossEntropyLoss(
+        weight=loss_weights.to(model.device) if loss_weights is not None else None
+    )
 
     output_dir = Path(args.output_dir)
     is_main_process = rank == 0
@@ -423,7 +460,7 @@ def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
     backbone_dir: Path | None = output_dir / "backbone" if (args.train_backbone or args.train_lora) else None
 
     for epoch in range(args.epochs):
-        if train_sampler is not None:
+        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
 
         forward_module.train()
@@ -485,7 +522,8 @@ def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
     if backbone_dir is not None:
         model.save_networks(str(backbone_dir))
 
-    model.save_classifier(output_dir, backbone_dir=backbone_dir)
+    extra_metadata = {"class_weight_strategy": class_weight_strategy} if class_weight_strategy else None
+    model.save_classifier(output_dir, backbone_dir=backbone_dir, extra_metadata=extra_metadata)
 
     summary_path = output_dir / "training_metrics.json"
     summary_path.write_text(

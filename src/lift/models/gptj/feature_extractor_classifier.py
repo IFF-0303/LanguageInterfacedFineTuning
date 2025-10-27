@@ -79,6 +79,19 @@ class InstructionClassificationDataset(Dataset):
         self.attention_mask = encodings["attention_mask"]
         self.labels = torch.tensor(labels, dtype=torch.long) if labels else None
 
+        self.num_labels = len(self.label2id) if self.label2id else 0
+        if self.labels is not None:
+            self.class_indices = self.labels.clone()
+            if self.class_indices.numel() > 0:
+                self.class_counts = torch.bincount(
+                    self.class_indices, minlength=self.num_labels
+                )
+            else:
+                self.class_counts = torch.zeros(self.num_labels, dtype=torch.long)
+        else:
+            self.class_indices = None
+            self.class_counts = None
+
     def _extract_label(self, example: Dict[str, Any]) -> str:
         if self.label_field:
             if self.label_field not in example:
@@ -102,6 +115,49 @@ class InstructionClassificationDataset(Dataset):
         if self.labels is not None:
             return self.input_ids[idx], self.attention_mask[idx], self.labels[idx]
         return self.input_ids[idx], self.attention_mask[idx]
+
+    def _require_class_statistics(self) -> None:
+        if self.class_indices is None or self.class_counts is None:
+            raise ValueError(
+                "Class statistics are unavailable. Provide label2id when initialising the dataset."
+            )
+        if self.class_indices.numel() == 0:
+            raise ValueError("Cannot compute class weights for an empty dataset.")
+
+    def compute_class_weights(
+        self,
+        strategy: str = "balanced",
+        smoothing: float = 0.0,
+    ) -> torch.Tensor:
+        """Return per-class weights following the specified rebalancing strategy."""
+
+        self._require_class_statistics()
+
+        counts = self.class_counts.to(dtype=torch.float32)
+        if smoothing > 0:
+            counts = counts + smoothing
+
+        if torch.any(counts <= 0):
+            raise ValueError("Encountered non-positive class counts when computing weights.")
+
+        if strategy == "balanced":
+            weights = 1.0 / counts
+        elif strategy == "sqrt_inv":
+            weights = torch.pow(counts, -0.5)
+        else:
+            raise ValueError(f"Unknown class rebalancing strategy: {strategy}")
+
+        return weights / weights.mean()
+
+    def compute_sample_weights(
+        self,
+        strategy: str = "balanced",
+        smoothing: float = 0.0,
+    ) -> torch.Tensor:
+        """Return per-sample weights compatible with :class:`WeightedRandomSampler`."""
+
+        class_weights = self.compute_class_weights(strategy=strategy, smoothing=smoothing)
+        return class_weights[self.class_indices]
 
 
 class LLMFeatureExtractorClassifier(nn.Module, LoRaQGPTJ):
@@ -281,7 +337,13 @@ class LLMFeatureExtractorClassifier(nn.Module, LoRaQGPTJ):
         features = self.extract_features(input_ids, attention_mask)
         return self.classifier(features)
 
-    def save_classifier(self, output_dir: str | Path, backbone_dir: str | Path | None = None) -> None:
+    def save_classifier(
+        self,
+        output_dir: str | Path,
+        backbone_dir: str | Path | None = None,
+        *,
+        extra_metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if not self.label2id:
             raise ValueError("Label mapping is empty. Call set_label_mapping() before saving.")
 
@@ -291,7 +353,7 @@ class LLMFeatureExtractorClassifier(nn.Module, LoRaQGPTJ):
         head_path = output_path / "classifier.pt"
         torch.save(self.classifier.state_dict(), head_path)
 
-        metadata = {
+        metadata: Dict[str, Any] = {
             "label2id": self.label2id,
             "id2label": {str(idx): label for idx, label in self.id2label.items()},
             "head_config": self.classifier_config.to_dict(),
@@ -307,6 +369,8 @@ class LLMFeatureExtractorClassifier(nn.Module, LoRaQGPTJ):
             except ValueError:
                 pass
             metadata["backbone_dir"] = str(backbone_path)
+        if extra_metadata:
+            metadata.update(extra_metadata)
         config_path = output_path / "classifier_config.json"
         config_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 

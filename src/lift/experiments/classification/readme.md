@@ -48,6 +48,8 @@ To run experiments on MNIST dataset, use  ```python -m lift.experiments.classifi
 For Synthetic Datasets and OpenML Dataset, there're different types of tasks to evaluate different models' performance in different settings. 
 To change the type of tasks, change the value of ```-t``` (stands for tasks) choosing from ```[accuracy, imbalance, sampling, label_corruption, teach, nn_gen_data]``` <br>
 
+For heavily imbalanced datasets (for example, disease screening tasks with positive:negative ratios such as 9:1), enable on-the-fly rebalancing by adding ```--class_weight balanced``` (or ```--class_weight sqrt_inv``` for a milder adjustment). This oversamples the minority class during fine-tuning without modifying the original dataset files.<br>
+
 Meaning of each arguments:<br>
 ```accuracy``` Calculate basic classification accuracy<br>
 ```imbalance``` Calculate basic classification accuracy, f1 score, recall, precision <br>

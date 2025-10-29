@@ -132,19 +132,29 @@ def load_examples(
     tab_features_field: str,
     feature_columns: Optional[List[str]] = None,
     require_label: bool = False,
-) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[List[str]]]:
+) -> Tuple[
+    List[Dict[str, Any]],
+    Optional[str],
+    Optional[List[str]],
+    Optional[List[str]],
+]:
     data_path = Path(file_path)
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset file '{file_path}' does not exist.")
 
     if data_path.suffix.lower() == ".csv":
-        examples, label_field, columns = load_health_dataset_from_csv(
+        (
+            examples,
+            label_field,
+            columns,
+            categorical_columns,
+        ) = load_health_dataset_from_csv(
             data_path,
             tab_features_field=tab_features_field,
             feature_columns=feature_columns,
             require_label=require_label,
         )
-        return examples, label_field, list(columns)
+        return examples, label_field, list(columns), list(categorical_columns)
 
     raw_content = data_path.read_text(encoding="utf-8").strip()
     if not raw_content:
@@ -162,7 +172,7 @@ def load_examples(
             raise ValueError(
                 "Unsupported dataset format: expected a JSON object, list, or newline-delimited entries."
             )
-    return examples, None, feature_columns
+    return examples, None, feature_columns, None
 
 
 def extract_tabular_matrix(examples: Iterable[Dict[str, Any]], field: str) -> np.ndarray:
@@ -187,8 +197,6 @@ def extract_tabular_matrix(examples: Iterable[Dict[str, Any]], field: str) -> np
     if not rows:
         raise ValueError("No tabular features found to feed into TabPFN.")
     matrix = np.asarray(rows, dtype=np.float32)
-    if not np.all(np.isfinite(matrix)):
-        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
     return matrix
 
 
@@ -308,12 +316,17 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
     device = torch.device("cuda", rank) if torch.cuda.is_available() else torch.device("cpu")
 
-    train_examples, inferred_label_field, feature_columns = load_examples(
+    (
+        train_examples,
+        inferred_label_field,
+        feature_columns,
+        categorical_columns,
+    ) = load_examples(
         args.train_file,
         tab_features_field=args.tab_features_field,
         require_label=True,
     )
-    val_examples, val_label_field, _ = load_examples(
+    val_examples, val_label_field, _, _ = load_examples(
         args.val_file,
         tab_features_field=args.tab_features_field,
         feature_columns=feature_columns,
@@ -338,7 +351,18 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         label2id[resolve_label(example, effective_label_field)] for example in train_examples
     ]
 
-    tab_extractor = TabPFNFeatureExtractor(device=args.tabpfn_device)
+    categorical_indices: Optional[List[int]] = None
+    if feature_columns is not None and categorical_columns:
+        categorical_indices = [
+            feature_columns.index(column)
+            for column in categorical_columns
+            if column in feature_columns
+        ]
+
+    tab_extractor = TabPFNFeatureExtractor(
+        device=args.tabpfn_device,
+        categorical_features=categorical_indices,
+    )
     tab_extractor.fit(train_tab_matrix, label_indices)
 
     train_tab_features = tab_extractor.transform(train_tab_matrix)
@@ -481,6 +505,10 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         }
         if feature_columns is not None:
             metadata["tab_feature_columns"] = feature_columns
+        if categorical_columns:
+            metadata["categorical_feature_columns"] = list(categorical_columns)
+        if categorical_indices:
+            metadata["categorical_feature_indices"] = list(int(i) for i in categorical_indices)
         backbone_dir: Path | None = None
         if args.train_backbone or args.train_lora:
             backbone_dir = output_dir / "backbone"

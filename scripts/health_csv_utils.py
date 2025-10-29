@@ -11,9 +11,11 @@ import pandas as pd
 __all__ = [
     "CARDIO_INSTRUCTION_TEXT",
     "DEFAULT_FEATURE_COLUMNS",
+    "CATEGORICAL_FEATURE_COLUMNS",
     "safe_value",
     "describe_health_status",
     "build_tabular_features",
+    "get_categorical_feature_indices",
     "convert_row_to_example",
     "load_health_dataset_from_csv",
 ]
@@ -46,6 +48,14 @@ DEFAULT_FEATURE_COLUMNS: List[str] = [
     "30880-0.0",  # urate
 ]
 
+"""Columns that should be treated as categorical when training TabPFN."""
+CATEGORICAL_FEATURE_COLUMNS: List[str] = [
+    "31-0.0",  # sex
+    "family_hd",  # family history
+    "924-0.0",  # walking speed
+    "HYPT",  # hypertension history
+]
+
 _MAPPING_FAMILY_HD = {0: "无家族性心脏病史", 1: "有家族性心脏病史"}
 _MAPPING_HYPT = {0: "无高血压病史", 1: "有高血压病史"}
 _MAPPING_WALK = {0: "步行速度慢", 1: "步行速度中等", 2: "步行速度快"}
@@ -70,7 +80,7 @@ def safe_value(value: Any, digits: int = 2) -> Optional[Any]:
 
 
 def _safe_numeric(value: Any) -> float:
-    """Return a float value for tabular features, replacing missing entries with ``nan``."""
+    """Return a float value for tabular features, preserving missing entries as ``nan``."""
 
     cleaned = safe_value(value, digits=6)
     if cleaned is None:
@@ -120,31 +130,14 @@ def build_tabular_features(
 ) -> List[float]:
     """Extract ordered numeric features for TabPFN from a CSV row."""
 
-    features: List[float] = []
-    for column in feature_columns:
-        if column == "31-0.0":  # sex encoded as 0/1, default to -1 for unknown
-            value = row.get(column)
-            if pd.isna(value) or value is None:
-                features.append(-1.0)
-            else:
-                features.append(float(value))
-            continue
-        if column == "family_hd":
-            value = row.get(column)
-            if pd.isna(value) or value is None:
-                features.append(-1.0)
-            else:
-                features.append(float(value))
-            continue
-        if column == "HYPT":
-            value = row.get(column)
-            if pd.isna(value) or value is None:
-                features.append(-1.0)
-            else:
-                features.append(float(value))
-            continue
-        features.append(_safe_numeric(row.get(column)))
-    return features
+    return [_safe_numeric(row.get(column)) for column in feature_columns]
+
+
+def get_categorical_feature_indices(feature_columns: Sequence[str]) -> List[int]:
+    """Return indices of categorical feature columns within ``feature_columns``."""
+
+    categorical_set = set(CATEGORICAL_FEATURE_COLUMNS)
+    return [idx for idx, column in enumerate(feature_columns) if column in categorical_set]
 
 
 def convert_row_to_example(
@@ -220,11 +213,14 @@ def load_health_dataset_from_csv(
     tab_features_field: str = "tab_features",
     feature_columns: Optional[Sequence[str]] = None,
     require_label: bool = False,
-) -> Tuple[List[Dict[str, Any]], Optional[str], List[str]]:
+) -> Tuple[List[Dict[str, Any]], Optional[str], List[str], List[str]]:
     """Load a CSV file and convert it into instruction examples."""
 
     df = pd.read_csv(csv_path)
     columns = list(feature_columns) if feature_columns is not None else DEFAULT_FEATURE_COLUMNS
+    categorical_columns = [
+        column for column in columns if column in CATEGORICAL_FEATURE_COLUMNS
+    ]
 
     examples: List[Dict[str, Any]] = []
     for _, row in df.iterrows():
@@ -241,4 +237,4 @@ def load_health_dataset_from_csv(
         raise ValueError(f"No usable rows found in CSV file: {csv_path}")
 
     label_field = "label" if any("label" in ex for ex in examples) else None
-    return examples, label_field, columns
+    return examples, label_field, columns, categorical_columns

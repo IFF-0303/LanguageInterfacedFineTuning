@@ -69,19 +69,29 @@ def load_examples(
     tab_features_field: str,
     feature_columns: Optional[List[str]] = None,
     require_label: bool = False,
-) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[List[str]]]:
+) -> Tuple[
+    List[Dict[str, Any]],
+    Optional[str],
+    Optional[List[str]],
+    Optional[List[str]],
+]:
     data_path = Path(file_path)
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset file '{file_path}' does not exist.")
 
     if data_path.suffix.lower() == ".csv":
-        examples, label_field, columns = load_health_dataset_from_csv(
+        (
+            examples,
+            label_field,
+            columns,
+            categorical_columns,
+        ) = load_health_dataset_from_csv(
             data_path,
             tab_features_field=tab_features_field,
             feature_columns=feature_columns,
             require_label=require_label,
         )
-        return examples, label_field, list(columns)
+        return examples, label_field, list(columns), list(categorical_columns)
 
     raw_content = data_path.read_text(encoding="utf-8").strip()
     if not raw_content:
@@ -99,7 +109,7 @@ def load_examples(
             raise ValueError(
                 "Unsupported dataset format: expected a JSON object, list, or newline-delimited entries."
             )
-    return examples, None, feature_columns
+    return examples, None, feature_columns, None
 
 
 def extract_tabular_matrix(examples: List[Dict[str, Any]], field: str) -> np.ndarray:
@@ -124,8 +134,6 @@ def extract_tabular_matrix(examples: List[Dict[str, Any]], field: str) -> np.nda
     if not rows:
         raise ValueError("No tabular features found to feed into TabPFN.")
     matrix = np.asarray(rows, dtype=np.float32)
-    if not np.all(np.isfinite(matrix)):
-        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
     return matrix
 
 
@@ -159,6 +167,17 @@ def main() -> None:
     tab_features_field = metadata.get("tab_features_field", args.tab_features_field)
     feature_columns_metadata = metadata.get("tab_feature_columns")
     feature_columns = list(feature_columns_metadata) if feature_columns_metadata else None
+    categorical_columns_metadata = metadata.get("categorical_feature_columns")
+    categorical_columns = (
+        list(categorical_columns_metadata) if categorical_columns_metadata else None
+    )
+    if categorical_columns and feature_columns:
+        missing_cats = [col for col in categorical_columns if col not in feature_columns]
+        if missing_cats:
+            raise ValueError(
+                "Categorical feature columns from metadata are missing in the dataset: "
+                f"{missing_cats}"
+            )
     label_field = args.label_field or metadata.get("label_field")
 
     tabpfn_state = args.tabpfn_path or metadata.get("tabpfn_state_path")
@@ -212,7 +231,7 @@ def main() -> None:
 
     model.load_classifier(args.classifier_dir)
 
-    examples, detected_label_field, feature_columns = load_examples(
+    examples, detected_label_field, feature_columns, _ = load_examples(
         args.data_file,
         tab_features_field=tab_features_field,
         feature_columns=feature_columns,

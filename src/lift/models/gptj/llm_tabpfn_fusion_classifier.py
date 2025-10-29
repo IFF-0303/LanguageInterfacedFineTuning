@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import pickle
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -98,7 +98,12 @@ class FusionClassifierHead(nn.Module):
 class TabPFNFeatureExtractor:
     """Light wrapper around TabPFNClassifier to produce tabular embeddings."""
 
-    def __init__(self, device: str = "cpu") -> None:
+    def __init__(
+        self,
+        *,
+        device: str = "cpu",
+        categorical_features: Optional[Sequence[int]] = None,
+    ) -> None:
         try:
             from tabpfn.scripts.transformer_prediction_interface import TabPFNClassifier
         except ImportError as exc:  # pragma: no cover - dependency not always present
@@ -107,7 +112,15 @@ class TabPFNFeatureExtractor:
             ) from exc
 
         self.device = device
-        self.model = TabPFNClassifier(device=device)
+        if categorical_features is not None:
+            categorical_indices = [int(idx) for idx in categorical_features]
+        else:
+            categorical_indices = None
+        self.categorical_features_indices = categorical_indices
+        tabpfn_kwargs: Dict[str, Any] = {"device": device}
+        if categorical_indices is not None:
+            tabpfn_kwargs["categorical_features_indices"] = categorical_indices
+        self.model = TabPFNClassifier(**tabpfn_kwargs)
         self._fitted = False
 
     @staticmethod
@@ -133,7 +146,12 @@ class TabPFNFeatureExtractor:
         return torch.from_numpy(np.asarray(proba, dtype=np.float32))
 
     def save(self, output_path: str | Path) -> None:
-        state = {"model": self.model, "fitted": self._fitted, "device": self.device}
+        state = {
+            "model": self.model,
+            "fitted": self._fitted,
+            "device": self.device,
+            "categorical_features_indices": self.categorical_features_indices,
+        }
         with Path(output_path).open("wb") as f:
             pickle.dump(state, f)
 
@@ -145,6 +163,7 @@ class TabPFNFeatureExtractor:
         obj.model = state["model"]
         obj._fitted = state.get("fitted", False)
         obj.device = state.get("device", "cpu")
+        obj.categorical_features_indices = state.get("categorical_features_indices")
         return obj
 
 

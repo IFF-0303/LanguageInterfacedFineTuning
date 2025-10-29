@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -18,6 +18,7 @@ from src.lift.models.gptj.llm_tabpfn_fusion_classifier import (
     LLMTabPFNFusionClassifier,
     TabPFNFeatureExtractor,
 )
+from scripts.health_csv_utils import load_health_dataset_from_csv
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,7 +28,11 @@ def parse_args() -> argparse.Namespace:
             "tabular features by fusing LLM and TabPFN representations."
         )
     )
-    parser.add_argument("--data-file", required=True, help="Path to the dataset (JSON/JSONL).")
+    parser.add_argument(
+        "--data-file",
+        required=True,
+        help="Path to the dataset (supports JSON/JSONL or CSV).",
+    )
     parser.add_argument(
         "--classifier-dir",
         required=True,
@@ -58,26 +63,43 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_examples(file_path: str) -> List[Dict[str, Any]]:
+def load_examples(
+    file_path: str,
+    *,
+    tab_features_field: str,
+    feature_columns: Optional[List[str]] = None,
+    require_label: bool = False,
+) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[List[str]]]:
     data_path = Path(file_path)
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset file '{file_path}' does not exist.")
+
+    if data_path.suffix.lower() == ".csv":
+        examples, label_field, columns = load_health_dataset_from_csv(
+            data_path,
+            tab_features_field=tab_features_field,
+            feature_columns=feature_columns,
+            require_label=require_label,
+        )
+        return examples, label_field, list(columns)
 
     raw_content = data_path.read_text(encoding="utf-8").strip()
     if not raw_content:
         raise ValueError(f"Dataset file '{file_path}' is empty.")
 
     try:
-        return [json.loads(line) for line in raw_content.splitlines() if line.strip()]
+        examples = [json.loads(line) for line in raw_content.splitlines() if line.strip()]
     except json.JSONDecodeError:
         parsed = json.loads(raw_content)
         if isinstance(parsed, dict):
-            return [parsed]
-        if isinstance(parsed, list):
-            return parsed
-        raise ValueError(
-            "Unsupported dataset format: expected a JSON object, list, or newline-delimited entries."
-        )
+            examples = [parsed]
+        elif isinstance(parsed, list):
+            examples = parsed
+        else:
+            raise ValueError(
+                "Unsupported dataset format: expected a JSON object, list, or newline-delimited entries."
+            )
+    return examples, None, feature_columns
 
 
 def extract_tabular_matrix(examples: List[Dict[str, Any]], field: str) -> np.ndarray:
@@ -92,10 +114,19 @@ def extract_tabular_matrix(examples: List[Dict[str, Any]], field: str) -> np.nda
             raise TypeError(
                 f"Tabular feature field '{field}' must be a sequence. Received: {type(values)!r}."
             )
-        rows.append([float(v) for v in values])
+        row_values: List[float] = []
+        for value in values:
+            try:
+                row_values.append(float(value))
+            except (TypeError, ValueError):
+                row_values.append(float("nan"))
+        rows.append(row_values)
     if not rows:
         raise ValueError("No tabular features found to feed into TabPFN.")
-    return np.asarray(rows, dtype=np.float32)
+    matrix = np.asarray(rows, dtype=np.float32)
+    if not np.all(np.isfinite(matrix)):
+        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+    return matrix
 
 
 def save_predictions(path: str, rows: List[Dict[str, Any]]) -> None:
@@ -124,6 +155,11 @@ def main() -> None:
     tab_feature_dim = int(metadata.get("tab_feature_dim", 0))
     if tab_feature_dim <= 0:
         raise ValueError("Classifier metadata missing a valid tab_feature_dim entry.")
+
+    tab_features_field = metadata.get("tab_features_field", args.tab_features_field)
+    feature_columns_metadata = metadata.get("tab_feature_columns")
+    feature_columns = list(feature_columns_metadata) if feature_columns_metadata else None
+    label_field = args.label_field or metadata.get("label_field")
 
     tabpfn_state = args.tabpfn_path or metadata.get("tabpfn_state_path")
     if not tabpfn_state:
@@ -176,8 +212,20 @@ def main() -> None:
 
     model.load_classifier(args.classifier_dir)
 
-    examples = load_examples(args.data_file)
-    tab_matrix = extract_tabular_matrix(examples, args.tab_features_field)
+    examples, detected_label_field, feature_columns = load_examples(
+        args.data_file,
+        tab_features_field=tab_features_field,
+        feature_columns=feature_columns,
+        require_label=False,
+    )
+    effective_label_field = label_field or detected_label_field
+
+    tab_matrix = extract_tabular_matrix(examples, tab_features_field)
+    if tab_matrix.shape[1] != tab_feature_dim:
+        raise ValueError(
+            "Tabular feature dimension mismatch between dataset and trained classifier: "
+            f"expected {tab_feature_dim}, found {tab_matrix.shape[1]}"
+        )
     tab_features = tab_extractor.transform(tab_matrix)
 
     dataset = FusionInstructionClassificationDataset(
@@ -185,7 +233,7 @@ def main() -> None:
         model.tokenizer,
         tab_features,
         label2id=None,
-        label_field=args.label_field,
+        label_field=effective_label_field,
         max_length=args.max_length,
     )
 

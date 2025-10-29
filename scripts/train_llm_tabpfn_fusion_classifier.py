@@ -7,7 +7,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -24,6 +24,7 @@ from src.lift.models.gptj.llm_tabpfn_fusion_classifier import (
     TabPFNFeatureExtractor,
 )
 from src.lift.models.gptj.samplers import DistributedWeightedRandomSampler
+from scripts.health_csv_utils import load_health_dataset_from_csv
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,8 +34,16 @@ def parse_args() -> argparse.Namespace:
             "features using a lightweight MLP head."
         )
     )
-    parser.add_argument("--train-file", required=True, help="Path to the training dataset (JSON/JSONL).")
-    parser.add_argument("--val-file", required=True, help="Path to the validation dataset (JSON/JSONL).")
+    parser.add_argument(
+        "--train-file",
+        required=True,
+        help="Path to the training dataset (supports JSON/JSONL or CSV).",
+    )
+    parser.add_argument(
+        "--val-file",
+        required=True,
+        help="Path to the validation dataset (supports JSON/JSONL or CSV).",
+    )
     parser.add_argument("--output-dir", required=True, help="Directory to store checkpoints and metadata.")
 
     parser.add_argument("--model-name", default="Qwen/Qwen2-0.5B-Instruct", help="Backbone LLM identifier.")
@@ -117,26 +126,43 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_examples(file_path: str) -> List[Dict[str, Any]]:
+def load_examples(
+    file_path: str,
+    *,
+    tab_features_field: str,
+    feature_columns: Optional[List[str]] = None,
+    require_label: bool = False,
+) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[List[str]]]:
     data_path = Path(file_path)
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset file '{file_path}' does not exist.")
+
+    if data_path.suffix.lower() == ".csv":
+        examples, label_field, columns = load_health_dataset_from_csv(
+            data_path,
+            tab_features_field=tab_features_field,
+            feature_columns=feature_columns,
+            require_label=require_label,
+        )
+        return examples, label_field, list(columns)
 
     raw_content = data_path.read_text(encoding="utf-8").strip()
     if not raw_content:
         raise ValueError(f"Dataset file '{file_path}' is empty.")
 
     try:
-        return [json.loads(line) for line in raw_content.splitlines() if line.strip()]
+        examples = [json.loads(line) for line in raw_content.splitlines() if line.strip()]
     except json.JSONDecodeError:
         parsed = json.loads(raw_content)
         if isinstance(parsed, dict):
-            return [parsed]
-        if isinstance(parsed, list):
-            return parsed
-        raise ValueError(
-            "Unsupported dataset format: expected a JSON object, list, or newline-delimited entries."
-        )
+            examples = [parsed]
+        elif isinstance(parsed, list):
+            examples = parsed
+        else:
+            raise ValueError(
+                "Unsupported dataset format: expected a JSON object, list, or newline-delimited entries."
+            )
+    return examples, None, feature_columns
 
 
 def extract_tabular_matrix(examples: Iterable[Dict[str, Any]], field: str) -> np.ndarray:
@@ -151,10 +177,19 @@ def extract_tabular_matrix(examples: Iterable[Dict[str, Any]], field: str) -> np
             raise TypeError(
                 f"Tabular feature field '{field}' must be iterable. Received: {type(values)!r}."
             )
-        rows.append([float(v) for v in values])
+        row_values: List[float] = []
+        for v in values:
+            try:
+                row_values.append(float(v))
+            except (TypeError, ValueError):
+                row_values.append(float("nan"))
+        rows.append(row_values)
     if not rows:
         raise ValueError("No tabular features found to feed into TabPFN.")
-    return np.asarray(rows, dtype=np.float32)
+    matrix = np.asarray(rows, dtype=np.float32)
+    if not np.all(np.isfinite(matrix)):
+        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+    return matrix
 
 
 def build_label_mapping(
@@ -273,10 +308,25 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
     device = torch.device("cuda", rank) if torch.cuda.is_available() else torch.device("cpu")
 
-    train_examples = load_examples(args.train_file)
-    val_examples = load_examples(args.val_file)
+    train_examples, inferred_label_field, feature_columns = load_examples(
+        args.train_file,
+        tab_features_field=args.tab_features_field,
+        require_label=True,
+    )
+    val_examples, val_label_field, _ = load_examples(
+        args.val_file,
+        tab_features_field=args.tab_features_field,
+        feature_columns=feature_columns,
+        require_label=True,
+    )
 
-    label2id = build_label_mapping(train_examples, args.label_field)
+    effective_label_field = args.label_field or inferred_label_field or val_label_field
+    if effective_label_field is None:
+        raise ValueError(
+            "Unable to determine the label field from the datasets. Provide --label-field explicitly."
+        )
+
+    label2id = build_label_mapping(train_examples, effective_label_field)
     num_labels = len(label2id)
     if num_labels < 2:
         raise ValueError("At least two distinct labels are required for classification.")
@@ -284,7 +334,9 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     train_tab_matrix = extract_tabular_matrix(train_examples, args.tab_features_field)
     val_tab_matrix = extract_tabular_matrix(val_examples, args.tab_features_field)
 
-    label_indices = [label2id[resolve_label(example, args.label_field)] for example in train_examples]
+    label_indices = [
+        label2id[resolve_label(example, effective_label_field)] for example in train_examples
+    ]
 
     tab_extractor = TabPFNFeatureExtractor(device=args.tabpfn_device)
     tab_extractor.fit(train_tab_matrix, label_indices)
@@ -304,7 +356,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         tokenizer,
         train_tab_features,
         label2id=label2id,
-        label_field=args.label_field,
+        label_field=effective_label_field,
         max_length=args.max_length,
     )
     val_dataset = FusionInstructionClassificationDataset(
@@ -312,7 +364,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         tokenizer,
         val_tab_features,
         label2id=label2id,
-        label_field=args.label_field,
+        label_field=effective_label_field,
         max_length=args.max_length,
     )
 
@@ -424,7 +476,11 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         metadata = {
             "fusion_mode": args.fusion_mode,
             "tabpfn_state_path": tabpfn_state_path.name,
+            "tab_features_field": args.tab_features_field,
+            "label_field": effective_label_field,
         }
+        if feature_columns is not None:
+            metadata["tab_feature_columns"] = feature_columns
         backbone_dir: Path | None = None
         if args.train_backbone or args.train_lora:
             backbone_dir = output_dir / "backbone"

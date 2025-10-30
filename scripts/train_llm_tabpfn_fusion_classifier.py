@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -18,6 +19,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler, Sampler, WeightedRandomSampler
 from tqdm import tqdm
 
+from sklearn.metrics import roc_auc_score
 from src.lift.models.gptj.feature_extractor_classifier import ClassifierHeadConfig
 from src.lift.models.gptj.llm_tabpfn_fusion_classifier import (
     FusionInstructionClassificationDataset,
@@ -292,8 +294,10 @@ def evaluate(
     forward_module.eval()
 
     loss_total = torch.zeros((), dtype=torch.float64, device=model.device)
-    correct_total = torch.zeros((), dtype=torch.float64, device=model.device)
     samples_total = torch.zeros((), dtype=torch.float64, device=model.device)
+
+    prob_chunks: List[torch.Tensor] = []
+    label_chunks: List[torch.Tensor] = []
 
     for batch in dataloader:
         input_ids = batch[0].to(model.device, non_blocking=True)
@@ -307,19 +311,60 @@ def evaluate(
             )
             loss = loss_fn(logits, labels)
 
-        preds = torch.argmax(logits, dim=-1)
-        correct_total += (preds == labels).sum().to(torch.float64)
+        probs = torch.softmax(logits, dim=-1)
+        prob_chunks.append(probs.detach().cpu())
+        label_chunks.append(labels.detach().cpu())
         samples_total += labels.size(0)
         loss_total += loss.detach().to(torch.float64) * labels.size(0)
 
-    stats = torch.stack([loss_total, correct_total, samples_total])
+    stats = torch.stack([loss_total, samples_total])
     if distributed:
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
-    total_loss, correct, total = stats.tolist()
+    total_loss, total = stats.tolist()
+
+    probs_tensor = torch.cat(prob_chunks, dim=0) if prob_chunks else torch.empty((0,), dtype=torch.float32)
+    labels_tensor = (
+        torch.cat(label_chunks, dim=0) if label_chunks else torch.empty((0,), dtype=torch.long)
+    )
+
+    if distributed:
+        world_size = dist.get_world_size()
+        gathered_probs: List[np.ndarray] = [None for _ in range(world_size)]  # type: ignore[list-item]
+        gathered_labels: List[np.ndarray] = [None for _ in range(world_size)]  # type: ignore[list-item]
+        dist.all_gather_object(gathered_probs, probs_tensor.numpy())
+        dist.all_gather_object(gathered_labels, labels_tensor.numpy())
+        probs_np = (
+            np.concatenate([arr for arr in gathered_probs if arr.size], axis=0)
+            if any(arr.size for arr in gathered_probs)
+            else np.empty((0,), dtype=np.float32)
+        )
+        labels_np = (
+            np.concatenate([arr for arr in gathered_labels if arr.size], axis=0)
+            if any(arr.size for arr in gathered_labels)
+            else np.empty((0,), dtype=np.int64)
+        )
+    else:
+        probs_np = probs_tensor.numpy()
+        labels_np = labels_tensor.numpy()
+
+    roc_auc: float
+    if probs_np.size == 0:
+        roc_auc = float("nan")
+    else:
+        try:
+            if probs_np.ndim == 1 or probs_np.shape[1] == 1:
+                roc_auc = roc_auc_score(labels_np, probs_np)
+            elif probs_np.shape[1] == 2:
+                roc_auc = roc_auc_score(labels_np, probs_np[:, 1])
+            else:
+                roc_auc = roc_auc_score(labels_np, probs_np, multi_class="ovr", average="macro")
+        except ValueError:
+            roc_auc = float("nan")
+
     return {
         "loss": total_loss / max(total, 1.0),
-        "accuracy": correct / max(total, 1.0),
+        "roc_auc": roc_auc,
     }
 
 
@@ -627,7 +672,7 @@ def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
     if is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    best_metrics = {"loss": float("inf"), "accuracy": 0.0}
+    best_metrics = {"loss": float("inf"), "roc_auc": -math.inf}
     best_classifier: Dict[str, Any] | None = None
     backbone_dir: Path | None = output_dir / "backbone" if (args.train_backbone or args.train_lora) else None
 
@@ -669,10 +714,10 @@ def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
         metrics = evaluate(model, forward_module, val_loader, criterion, distributed)
         if is_main_process:
             print(
-                f"Epoch {epoch + 1}: val_loss={metrics['loss']:.4f}, val_accuracy={metrics['accuracy']:.4f}"
+                f"Epoch {epoch + 1}: val_loss={metrics['loss']:.4f}, val_roc_auc={metrics['roc_auc']:.4f}"
             )
 
-        if is_main_process and metrics["accuracy"] >= best_metrics["accuracy"]:
+        if is_main_process and not math.isnan(metrics["roc_auc"]) and metrics["roc_auc"] >= best_metrics["roc_auc"]:
             best_metrics = metrics
             best_classifier = {
                 "state": {k: v.cpu() for k, v in model.classifier.state_dict().items()},

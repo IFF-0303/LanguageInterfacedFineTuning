@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler, Sampler, WeightedRandomSampler
 from tqdm import tqdm
 
@@ -276,38 +277,142 @@ def resolve_label(example: Dict[str, Any], label_field: str | None = None) -> st
     )
 
 
-def configure_sampler(
-    dataset: FusionInstructionClassificationDataset,
-    class_weight_strategy: str,
-    batch_size: int,
-    *,
+def is_distributed() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def evaluate(
+    model: LLMTabPFNFusionClassifier,
+    forward_module: torch.nn.Module,
+    dataloader: DataLoader,
+    loss_fn: torch.nn.Module,
     distributed: bool,
-) -> Tuple[Sampler[int] | None, torch.Tensor | None]:
-    sample_weights = None
-    if class_weight_strategy != "none":
-        sample_weights = dataset.compute_sample_weights(strategy=class_weight_strategy)
+) -> Dict[str, float]:
+    model.eval()
+    forward_module.eval()
+
+    loss_total = torch.zeros((), dtype=torch.float64, device=model.device)
+    correct_total = torch.zeros((), dtype=torch.float64, device=model.device)
+    samples_total = torch.zeros((), dtype=torch.float64, device=model.device)
+
+    for batch in dataloader:
+        input_ids = batch[0].to(model.device, non_blocking=True)
+        attention_mask = batch[1].to(model.device, non_blocking=True)
+        tab_features = batch[2].to(model.device, non_blocking=True)
+        labels = batch[3].to(model.device, non_blocking=True)
+
+        with torch.no_grad():
+            logits = forward_module(
+                input_ids=input_ids, attention_mask=attention_mask, tab_features=tab_features
+            )
+            loss = loss_fn(logits, labels)
+
+        preds = torch.argmax(logits, dim=-1)
+        correct_total += (preds == labels).sum().to(torch.float64)
+        samples_total += labels.size(0)
+        loss_total += loss.detach().to(torch.float64) * labels.size(0)
+
+    stats = torch.stack([loss_total, correct_total, samples_total])
+    if distributed:
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+    total_loss, correct, total = stats.tolist()
+    return {
+        "loss": total_loss / max(total, 1.0),
+        "accuracy": correct / max(total, 1.0),
+    }
+
+
+def setup_distributed(rank: int, world_size: int) -> None:
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "12355")
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+
+def cleanup_distributed() -> None:
+    if is_distributed():
+        dist.destroy_process_group()
+
+
+def build_dataloaders(
+    train_dataset: FusionInstructionClassificationDataset,
+    val_dataset: FusionInstructionClassificationDataset,
+    batch_size: int,
+    num_workers: int,
+    rank: int,
+    world_size: int,
+    *,
+    class_weight_strategy: str | None = None,
+) -> Tuple[DataLoader, DataLoader, Sampler | None, torch.Tensor | None]:
+    distributed = torch.cuda.is_available() and world_size > 1
+
+    train_sampler: Sampler | None = None
+    val_sampler: DistributedSampler | None = None
 
     if distributed:
-        if sample_weights is not None:
-            sampler = DistributedWeightedRandomSampler(
-                sample_weights, num_samples=len(dataset), replacement=True
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+        )
+
+    sample_weights = None
+    if class_weight_strategy:
+        sample_weights = train_dataset.compute_sample_weights(strategy=class_weight_strategy)
+        if distributed:
+            train_sampler = DistributedWeightedRandomSampler(
+                sample_weights,
+                num_replicas=world_size,
+                rank=rank,
             )
         else:
-            sampler = DistributedSampler(dataset)
-    else:
-        if sample_weights is not None:
-            sampler = WeightedRandomSampler(sample_weights, num_samples=len(dataset), replacement=True)
-        else:
-            sampler = None
+            train_sampler = WeightedRandomSampler(
+                weights=sample_weights,
+                num_samples=len(sample_weights),
+                replacement=True,
+            )
+    elif distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+        )
 
-    if class_weight_strategy == "none":
-        class_weights = None
-    else:
-        class_weights = dataset.compute_class_weights(strategy=class_weight_strategy)
-    return sampler, class_weights
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+    )
+
+    class_weights = None
+    if class_weight_strategy:
+        class_weights = train_dataset.compute_class_weights(strategy=class_weight_strategy)
+
+    return train_loader, val_loader, train_sampler, class_weights
 
 
-def setup_model(args: argparse.Namespace, num_labels: int, tab_feature_dim: int) -> LLMTabPFNFusionClassifier:
+def setup_model(
+    args: argparse.Namespace, num_labels: int, tab_feature_dim: int, *, distributed: bool
+) -> LLMTabPFNFusionClassifier:
     head_cfg = ClassifierHeadConfig(
         hidden_dims=args.hidden_dims,
         dropout=args.dropout,
@@ -324,6 +429,7 @@ def setup_model(args: argparse.Namespace, num_labels: int, tab_feature_dim: int)
         classifier_config=head_cfg,
         tab_feature_dim=tab_feature_dim,
         fusion_mode=args.fusion_mode,
+        wrap_backbone_with_ddp=not distributed,
     )
 
     if args.adapter_path and not args.no_adapter:
@@ -339,14 +445,15 @@ def setup_model(args: argparse.Namespace, num_labels: int, tab_feature_dim: int)
     return model
 
 
-def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
-    if world_size > 1:
-        os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "12355")
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
+    distributed = torch.cuda.is_available() and world_size > 1
+
+    if distributed:
+        setup_distributed(rank, world_size)
         torch.cuda.set_device(rank)
 
-    device = torch.device("cuda", rank) if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
+    is_main_process = rank == 0
 
     (
         train_examples,
@@ -413,11 +520,13 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
         if train_tab_features is None:
             train_tab_features = tab_extractor.transform(train_tab_matrix)
-            maybe_save_cached_features(args.train_tabpfn_cache, train_tab_features)
+            if is_main_process:
+                maybe_save_cached_features(args.train_tabpfn_cache, train_tab_features)
 
         if val_tab_features is None:
             val_tab_features = tab_extractor.transform(val_tab_matrix)
-            maybe_save_cached_features(args.val_tabpfn_cache, val_tab_features)
+            if is_main_process:
+                maybe_save_cached_features(args.val_tabpfn_cache, val_tab_features)
 
     if train_tab_features is None or val_tab_features is None:
         raise RuntimeError("Failed to obtain TabPFN features for both training and validation splits.")
@@ -430,10 +539,24 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             f"{train_tab_features.size(1)} vs {val_tab_features.size(1)}"
         )
 
-    model = setup_model(args, num_labels=num_labels, tab_feature_dim=train_tab_features.size(1))
+    model = setup_model(
+        args,
+        num_labels=num_labels,
+        tab_feature_dim=train_tab_features.size(1),
+        distributed=distributed,
+    )
     model.to(device)
     model.device = device
     model.set_label_mapping(label2id)
+
+    forward_module: torch.nn.Module = model
+    if distributed:
+        forward_module = DistributedDataParallel(
+            model,
+            device_ids=[rank],
+            output_device=rank,
+            find_unused_parameters=False,
+        )
 
     tokenizer = model.tokenizer
 
@@ -454,43 +577,40 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         max_length=args.max_length,
     )
 
-    sampler, class_weights = configure_sampler(
-        train_dataset,
-        args.class_weight,
-        args.batch_size,
-        distributed=world_size > 1,
-    )
+    class_weight_strategy = None if args.class_weight == "none" else args.class_weight
 
-    train_loader = DataLoader(
+    train_loader, val_loader, train_sampler, class_weights = build_dataloaders(
         train_dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        shuffle=sampler is None,
-        num_workers=args.num_workers,
-    )
-    val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
+        args.batch_size,
+        args.num_workers,
+        rank,
+        world_size,
+        class_weight_strategy=class_weight_strategy,
     )
 
     criterion = nn.CrossEntropyLoss(
         weight=class_weights.to(device) if class_weights is not None else None
     )
 
-    optimizer_grouped_parameters: List[Dict[str, Any]] = [
-        {"params": model.classifier.parameters(), "lr": args.learning_rate}
-    ]
+    classifier_params = [p for p in model.classifier.parameters() if p.requires_grad]
+    optimizer_groups: List[Dict[str, Any]] = []
+    if classifier_params:
+        optimizer_groups.append({"params": classifier_params, "lr": args.learning_rate})
 
-    backbone_lr = args.backbone_learning_rate or args.learning_rate
     if args.train_backbone or args.train_lora:
-        optimizer_grouped_parameters.append(
-            {"params": list(model.backbone_parameters()), "lr": backbone_lr}
+        backbone_params = [p for p in model.backbone_parameters() if p.requires_grad]
+        if backbone_params:
+            backbone_lr = args.backbone_learning_rate or args.learning_rate
+            optimizer_groups.append({"params": backbone_params, "lr": backbone_lr})
+
+    if not optimizer_groups:
+        raise ValueError(
+            "No trainable parameters were found. Ensure the classifier head or backbone is unfrozen."
         )
 
     optimizer = torch.optim.AdamW(
-        optimizer_grouped_parameters,
+        optimizer_groups,
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
@@ -503,21 +623,39 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             total_iters=max(args.warmup_steps, 1),
         )
 
-    model.train()
+    output_dir = Path(args.output_dir)
+    if is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    best_metrics = {"loss": float("inf"), "accuracy": 0.0}
+    best_classifier: Dict[str, Any] | None = None
+    backbone_dir: Path | None = output_dir / "backbone" if (args.train_backbone or args.train_lora) else None
+
     for epoch in range(args.epochs):
-        if world_size > 1 and isinstance(sampler, DistributedSampler):
-            sampler.set_epoch(epoch)
+        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(epoch)
 
-        epoch_loss = 0.0
-        progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}", disable=rank != 0)
+        forward_module.train()
+        model.train()
+
+        progress = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch + 1}/{args.epochs}",
+            disable=not is_main_process,
+        )
+
         for batch in progress:
-            input_ids = batch[0].to(device)
-            attention_mask = batch[1].to(device)
-            tab_features = batch[2].to(device)
-            labels = batch[3].to(device)
+            input_ids = batch[0].to(device, non_blocking=True)
+            attention_mask = batch[1].to(device, non_blocking=True)
+            tab_features = batch[2].to(device, non_blocking=True)
+            labels = batch[3].to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            logits = model(input_ids=input_ids, attention_mask=attention_mask, tab_features=tab_features)
+            optimizer.zero_grad(set_to_none=True)
+            logits = forward_module(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                tab_features=tab_features,
+            )
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
@@ -525,71 +663,75 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             if scheduler is not None:
                 scheduler.step()
 
-            epoch_loss += loss.item()
-            progress.set_postfix({"loss": epoch_loss / (progress.n or 1)})
+            if is_main_process:
+                progress.set_postfix(loss=loss.detach().item())
 
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                input_ids = batch[0].to(device)
-                attention_mask = batch[1].to(device)
-                tab_features = batch[2].to(device)
-                labels = batch[3].to(device)
+        metrics = evaluate(model, forward_module, val_loader, criterion, distributed)
+        if is_main_process:
+            print(
+                f"Epoch {epoch + 1}: val_loss={metrics['loss']:.4f}, val_accuracy={metrics['accuracy']:.4f}"
+            )
 
-                logits = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    tab_features=tab_features,
-                )
-                predictions = torch.argmax(logits, dim=-1)
-                correct += (predictions == labels).sum().item()
-                total += labels.size(0)
+        if is_main_process and metrics["accuracy"] >= best_metrics["accuracy"]:
+            best_metrics = metrics
+            best_classifier = {
+                "state": {k: v.cpu() for k, v in model.classifier.state_dict().items()},
+                "label2id": dict(model.label2id),
+            }
+            if backbone_dir is not None:
+                model.save_networks(str(backbone_dir))
 
-        accuracy = correct / max(total, 1)
-        if rank == 0:
-            print(f"Validation accuracy after epoch {epoch + 1}: {accuracy:.4f}")
-        model.train()
-
-    if rank == 0:
-        output_dir = Path(args.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        metadata = {
-            "fusion_mode": args.fusion_mode,
-            "tab_features_field": args.tab_features_field,
-            "label_field": effective_label_field,
+    if is_main_process and best_classifier is None:
+        best_classifier = {
+            "state": {k: v.cpu() for k, v in model.classifier.state_dict().items()},
+            "label2id": dict(model.label2id),
         }
-        tabpfn_state_path: Optional[Path] = None
-        if tab_extractor is not None:
-            tabpfn_state_path = output_dir / "tabpfn.pkl"
-            tab_extractor.save(tabpfn_state_path)
-            metadata["tabpfn_state_path"] = tabpfn_state_path.name
-        else:
-            metadata["tabpfn_state_path"] = None
-        if feature_columns is not None:
-            metadata["tab_feature_columns"] = feature_columns
-        if categorical_columns:
-            metadata["categorical_feature_columns"] = list(categorical_columns)
-        if categorical_indices:
-            metadata["categorical_feature_indices"] = list(int(i) for i in categorical_indices)
-        backbone_dir: Path | None = None
-        if args.train_backbone or args.train_lora:
-            backbone_dir = output_dir / "backbone"
-            backbone_dir.mkdir(parents=True, exist_ok=True)
-            model.save_networks(str(backbone_dir))
-        elif args.adapter_path and not args.no_adapter:
-            backbone_dir = Path(args.adapter_path)
 
-        model.save_classifier(
-            output_dir,
-            backbone_dir=str(backbone_dir) if backbone_dir is not None else None,
-            extra_metadata=metadata,
-        )
+    if is_main_process and best_classifier is not None:
+        model.classifier.load_state_dict(best_classifier["state"])
+        model.set_label_mapping(best_classifier["label2id"])
 
-    if world_size > 1:
-        dist.destroy_process_group()
+    if distributed:
+        cleanup_distributed()
+
+    if not is_main_process:
+        return
+
+    if backbone_dir is not None:
+        model.save_networks(str(backbone_dir))
+
+    metadata = {
+        "fusion_mode": args.fusion_mode,
+        "tab_features_field": args.tab_features_field,
+        "label_field": effective_label_field,
+        "class_weight_strategy": class_weight_strategy,
+    }
+    tabpfn_state_path: Optional[Path] = None
+    if tab_extractor is not None:
+        tabpfn_state_path = output_dir / "tabpfn.pkl"
+        tab_extractor.save(tabpfn_state_path)
+        metadata["tabpfn_state_path"] = tabpfn_state_path.name
+    else:
+        metadata["tabpfn_state_path"] = None
+    if feature_columns is not None:
+        metadata["tab_feature_columns"] = feature_columns
+    if categorical_columns:
+        metadata["categorical_feature_columns"] = list(categorical_columns)
+    if categorical_indices:
+        metadata["categorical_feature_indices"] = list(int(i) for i in categorical_indices)
+
+    model.save_classifier(
+        output_dir,
+        backbone_dir=str(backbone_dir) if backbone_dir is not None else None,
+        extra_metadata=metadata,
+    )
+
+    summary_path = output_dir / "training_metrics.json"
+    summary_path.write_text(
+        json.dumps(best_metrics, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print("Training complete. Best validation metrics:", best_metrics)
 
 
 def main() -> None:
@@ -601,9 +743,9 @@ def main() -> None:
 
     world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
     if world_size > 1:
-        mp.spawn(train_worker, args=(world_size, args), nprocs=world_size, join=True)
+        mp.spawn(train, args=(world_size, args), nprocs=world_size, join=True)
     else:
-        train_worker(rank=0, world_size=world_size, args=args)
+        train(rank=0, world_size=world_size, args=args)
 
 
 if __name__ == "__main__":

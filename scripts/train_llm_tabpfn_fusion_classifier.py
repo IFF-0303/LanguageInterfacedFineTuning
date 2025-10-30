@@ -22,6 +22,8 @@ from src.lift.models.gptj.llm_tabpfn_fusion_classifier import (
     FusionInstructionClassificationDataset,
     LLMTabPFNFusionClassifier,
     TabPFNFeatureExtractor,
+    load_tabpfn_feature_tensor,
+    save_tabpfn_feature_tensor,
 )
 from src.lift.models.gptj.samplers import DistributedWeightedRandomSampler
 from scripts.health_csv_utils import load_health_dataset_from_csv
@@ -71,6 +73,14 @@ def parse_args() -> argparse.Namespace:
         help="Strategy for combining LLM and TabPFN representations.",
     )
     parser.add_argument("--tabpfn-device", default="cpu", help="Device to run the TabPFN extractor on.")
+    parser.add_argument(
+        "--train-tabpfn-cache",
+        help="Optional path to cached TabPFN features for the training split.",
+    )
+    parser.add_argument(
+        "--val-tabpfn-cache",
+        help="Optional path to cached TabPFN features for the validation split.",
+    )
 
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size for training.")
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs.")
@@ -198,6 +208,28 @@ def extract_tabular_matrix(examples: Iterable[Dict[str, Any]], field: str) -> np
         raise ValueError("No tabular features found to feed into TabPFN.")
     matrix = np.asarray(rows, dtype=np.float32)
     return matrix
+
+
+def maybe_load_cached_features(path: Optional[str], expected_rows: int, split_name: str) -> Optional[torch.Tensor]:
+    if not path:
+        return None
+    cache_path = Path(path)
+    if not cache_path.exists():
+        return None
+
+    features = load_tabpfn_feature_tensor(cache_path)
+    if features.size(0) != expected_rows:
+        raise ValueError(
+            f"Cached TabPFN features at '{cache_path}' contain {features.size(0)} rows, "
+            f"but {expected_rows} were expected for the {split_name} split."
+        )
+    return features
+
+
+def maybe_save_cached_features(path: Optional[str], features: torch.Tensor) -> None:
+    if not path:
+        return
+    save_tabpfn_feature_tensor(path, features)
 
 
 def build_label_mapping(
@@ -347,6 +379,18 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     train_tab_matrix = extract_tabular_matrix(train_examples, args.tab_features_field)
     val_tab_matrix = extract_tabular_matrix(val_examples, args.tab_features_field)
 
+    train_tab_features = maybe_load_cached_features(
+        args.train_tabpfn_cache, len(train_examples), "training"
+    )
+    if train_tab_features is not None:
+        train_tab_features = train_tab_features.to(dtype=torch.float32, device="cpu")
+
+    val_tab_features = maybe_load_cached_features(
+        args.val_tabpfn_cache, len(val_examples), "validation"
+    )
+    if val_tab_features is not None:
+        val_tab_features = val_tab_features.to(dtype=torch.float32, device="cpu")
+
     label_indices = [
         label2id[resolve_label(example, effective_label_field)] for example in train_examples
     ]
@@ -359,14 +403,32 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             if column in feature_columns
         ]
 
-    tab_extractor = TabPFNFeatureExtractor(
-        device=args.tabpfn_device,
-        categorical_features=categorical_indices,
-    )
-    tab_extractor.fit(train_tab_matrix, label_indices)
+    tab_extractor: Optional[TabPFNFeatureExtractor] = None
+    if train_tab_features is None or val_tab_features is None:
+        tab_extractor = TabPFNFeatureExtractor(
+            device=args.tabpfn_device,
+            categorical_features=categorical_indices,
+        )
+        tab_extractor.fit(train_tab_matrix, label_indices)
 
-    train_tab_features = tab_extractor.transform(train_tab_matrix)
-    val_tab_features = tab_extractor.transform(val_tab_matrix)
+        if train_tab_features is None:
+            train_tab_features = tab_extractor.transform(train_tab_matrix)
+            maybe_save_cached_features(args.train_tabpfn_cache, train_tab_features)
+
+        if val_tab_features is None:
+            val_tab_features = tab_extractor.transform(val_tab_matrix)
+            maybe_save_cached_features(args.val_tabpfn_cache, val_tab_features)
+
+    if train_tab_features is None or val_tab_features is None:
+        raise RuntimeError("Failed to obtain TabPFN features for both training and validation splits.")
+
+    train_tab_features = train_tab_features.to(dtype=torch.float32, device="cpu")
+    val_tab_features = val_tab_features.to(dtype=torch.float32, device="cpu")
+    if train_tab_features.size(1) != val_tab_features.size(1):
+        raise ValueError(
+            "Cached TabPFN features for training and validation have mismatched dimensionality: "
+            f"{train_tab_features.size(1)} vs {val_tab_features.size(1)}"
+        )
 
     model = setup_model(args, num_labels=num_labels, tab_feature_dim=train_tab_features.size(1))
     model.to(device)
@@ -494,15 +556,18 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        tabpfn_state_path = output_dir / "tabpfn.pkl"
-        tab_extractor.save(tabpfn_state_path)
-
         metadata = {
             "fusion_mode": args.fusion_mode,
-            "tabpfn_state_path": tabpfn_state_path.name,
             "tab_features_field": args.tab_features_field,
             "label_field": effective_label_field,
         }
+        tabpfn_state_path: Optional[Path] = None
+        if tab_extractor is not None:
+            tabpfn_state_path = output_dir / "tabpfn.pkl"
+            tab_extractor.save(tabpfn_state_path)
+            metadata["tabpfn_state_path"] = tabpfn_state_path.name
+        else:
+            metadata["tabpfn_state_path"] = None
         if feature_columns is not None:
             metadata["tab_feature_columns"] = feature_columns
         if categorical_columns:

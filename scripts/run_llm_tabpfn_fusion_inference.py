@@ -17,6 +17,8 @@ from src.lift.models.gptj.llm_tabpfn_fusion_classifier import (
     FusionInstructionClassificationDataset,
     LLMTabPFNFusionClassifier,
     TabPFNFeatureExtractor,
+    load_tabpfn_feature_tensor,
+    save_tabpfn_feature_tensor,
 )
 from scripts.health_csv_utils import load_health_dataset_from_csv
 
@@ -36,7 +38,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--classifier-dir",
         required=True,
-        help="Directory containing classifier.pt, classifier_config.json, and TabPFN state.",
+        help=(
+            "Directory containing classifier.pt, classifier_config.json, and optionally a TabPFN state file."
+        ),
     )
     parser.add_argument("--model-name", default="Qwen/Qwen2-0.5B-Instruct", help="Backbone model identifier.")
     parser.add_argument(
@@ -56,6 +60,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tab-features-field", default="tab_features", help="Field containing tabular features.")
     parser.add_argument("--tabpfn-path", help="Override path to the saved TabPFN state file.")
+    parser.add_argument(
+        "--tabpfn-cache",
+        help="Optional path to cached TabPFN features for the inference dataset.",
+    )
     parser.add_argument(
         "--output-file",
         help="Optional file to store predictions (supports .json or .jsonl).",
@@ -137,6 +145,28 @@ def extract_tabular_matrix(examples: List[Dict[str, Any]], field: str) -> np.nda
     return matrix
 
 
+def maybe_load_cached_features(path: Optional[str], expected_rows: int) -> Optional[torch.Tensor]:
+    if not path:
+        return None
+    cache_path = Path(path)
+    if not cache_path.exists():
+        return None
+
+    features = load_tabpfn_feature_tensor(cache_path)
+    if features.size(0) != expected_rows:
+        raise ValueError(
+            f"Cached TabPFN features at '{cache_path}' contain {features.size(0)} rows, "
+            f"but {expected_rows} rows were expected."
+        )
+    return features.to(dtype=torch.float32, device="cpu")
+
+
+def maybe_save_cached_features(path: Optional[str], features: torch.Tensor) -> None:
+    if not path:
+        return
+    save_tabpfn_feature_tensor(path, features)
+
+
 def save_predictions(path: str, rows: List[Dict[str, Any]]) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,18 +211,14 @@ def main() -> None:
     label_field = args.label_field or metadata.get("label_field")
 
     tabpfn_state = args.tabpfn_path or metadata.get("tabpfn_state_path")
-    if not tabpfn_state:
-        raise ValueError(
-            "No TabPFN state path provided. Pass --tabpfn-path or ensure metadata contains 'tabpfn_state_path'."
-        )
-
-    tabpfn_path = Path(tabpfn_state)
-    if not tabpfn_path.is_absolute():
-        tabpfn_path = Path(args.classifier_dir) / tabpfn_path
-    if not tabpfn_path.exists():
-        raise FileNotFoundError(f"TabPFN state file '{tabpfn_path}' not found.")
-
-    tab_extractor = TabPFNFeatureExtractor.load(tabpfn_path)
+    tab_extractor: Optional[TabPFNFeatureExtractor] = None
+    if tabpfn_state:
+        tabpfn_path = Path(tabpfn_state)
+        if not tabpfn_path.is_absolute():
+            tabpfn_path = Path(args.classifier_dir) / tabpfn_path
+        if not tabpfn_path.exists():
+            raise FileNotFoundError(f"TabPFN state file '{tabpfn_path}' not found.")
+        tab_extractor = TabPFNFeatureExtractor.load(tabpfn_path)
 
     saved_backbone = metadata.get("backbone_dir")
     backbone_path: Path | None = None
@@ -239,13 +265,29 @@ def main() -> None:
     )
     effective_label_field = label_field or detected_label_field
 
-    tab_matrix = extract_tabular_matrix(examples, tab_features_field)
-    if tab_matrix.shape[1] != tab_feature_dim:
-        raise ValueError(
-            "Tabular feature dimension mismatch between dataset and trained classifier: "
-            f"expected {tab_feature_dim}, found {tab_matrix.shape[1]}"
-        )
-    tab_features = tab_extractor.transform(tab_matrix)
+    cached_tab_features = maybe_load_cached_features(args.tabpfn_cache, len(examples))
+    tab_features: torch.Tensor
+    if cached_tab_features is not None:
+        if cached_tab_features.size(1) != tab_feature_dim:
+            raise ValueError(
+                "Cached TabPFN features have mismatched dimensionality: "
+                f"expected {tab_feature_dim}, found {cached_tab_features.size(1)}"
+            )
+        tab_features = cached_tab_features
+    else:
+        if tab_extractor is None:
+            raise ValueError(
+                "No TabPFN state available to compute features. Provide --tabpfn-path or a cached feature file via --tabpfn-cache."
+            )
+        tab_matrix = extract_tabular_matrix(examples, tab_features_field)
+        if tab_matrix.shape[1] != tab_feature_dim:
+            raise ValueError(
+                "Tabular feature dimension mismatch between dataset and trained classifier: "
+                f"expected {tab_feature_dim}, found {tab_matrix.shape[1]}"
+            )
+        tab_features = tab_extractor.transform(tab_matrix)
+        tab_features = tab_features.to(dtype=torch.float32, device="cpu")
+        maybe_save_cached_features(args.tabpfn_cache, tab_features)
 
     dataset = FusionInstructionClassificationDataset(
         examples,

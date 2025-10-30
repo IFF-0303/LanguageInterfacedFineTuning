@@ -167,6 +167,55 @@ class TabPFNFeatureExtractor:
         return obj
 
 
+def _ensure_tensor(data: Any) -> torch.Tensor:
+    """Convert arbitrary data structures to a float32 ``torch.Tensor``."""
+
+    if isinstance(data, torch.Tensor):
+        tensor = data
+    elif isinstance(data, np.ndarray):
+        tensor = torch.from_numpy(data)
+    else:
+        tensor = torch.tensor(data, dtype=torch.float32)
+    return tensor.to(dtype=torch.float32)
+
+
+def load_tabpfn_feature_tensor(path: str | Path) -> torch.Tensor:
+    """Load cached TabPFN features stored as ``.pt``/``.pth`` or ``.npy``."""
+
+    cache_path = Path(path)
+    if not cache_path.exists():
+        raise FileNotFoundError(f"Cached TabPFN feature file '{cache_path}' not found.")
+
+    suffix = cache_path.suffix.lower()
+    try:
+        if suffix == ".npy":
+            array = np.load(cache_path)
+            return _ensure_tensor(array)
+        if suffix in {".pt", ".pth"}:
+            data = torch.load(cache_path)
+            return _ensure_tensor(data)
+        # Try torch.load first for other suffixes
+        data = torch.load(cache_path)
+        return _ensure_tensor(data)
+    except Exception:
+        # Fall back to numpy if torch.load fails (e.g. plain arrays saved via np.save)
+        array = np.load(cache_path)
+        return _ensure_tensor(array)
+
+
+def save_tabpfn_feature_tensor(path: str | Path, tensor: torch.Tensor) -> None:
+    """Persist TabPFN features to disk, supporting ``.pt``/``.pth`` and ``.npy`` formats."""
+
+    cache_path = Path(path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tensor_to_save = tensor.detach().cpu().to(dtype=torch.float32)
+    suffix = cache_path.suffix.lower()
+    if suffix == ".npy":
+        np.save(cache_path, tensor_to_save.numpy())
+    else:
+        torch.save(tensor_to_save, cache_path)
+
+
 class FusionInstructionClassificationDataset(InstructionClassificationDataset):
     """Instruction dataset augmented with TabPFN features for fusion models."""
 

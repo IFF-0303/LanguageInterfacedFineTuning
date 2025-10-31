@@ -174,6 +174,24 @@ def main() -> None:
     structured_config_data = metadata.get("structured_config", {})
     structured_config = StructuredEncoderConfig.from_dict(structured_config_data)
 
+    saved_backbone = metadata.get("backbone_dir")
+    backbone_path: Path | None = None
+    if saved_backbone:
+        candidate = Path(saved_backbone)
+        if not candidate.is_absolute():
+            candidate = Path(args.classifier_dir) / candidate
+        if candidate.exists():
+            backbone_path = candidate
+        else:
+            print(
+                f"Warning: Saved backbone directory '{candidate}' not found. "
+                "Falling back to CLI arguments."
+            )
+
+    use_lora = metadata.get("use_lora", not args.no_adapter)
+    if args.no_adapter:
+        use_lora = False
+
     structured_metadata = metadata.get("structured_metadata", {})
     numeric_fields = structured_metadata.get("numeric_fields", [])
     categorical_fields = structured_metadata.get("categorical_fields", [])
@@ -195,10 +213,20 @@ def main() -> None:
         wrap_backbone_with_ddp=True,
         model_name=args.model_name,
         model_provider=args.model_provider,
-        adapter_path=args.adapter_path,
-        adapter=not args.no_adapter,
+        adapter=use_lora,
+        model_path=(
+            args.adapter_path
+            or (str(backbone_path) if backbone_path is not None else args.model_name)
+        ),
         load_in_4bit=args.load_in_4bit,
     )
+    if backbone_path is not None:
+        model.load_networks(str(backbone_path))
+        model.freeze_backbone()
+    elif args.adapter_path and use_lora:
+        model.load_networks(args.adapter_path)
+        model.freeze_backbone()
+
     model.set_label_mapping({label: int(idx) for label, idx in label2id.items()})
     model.load_classifier(args.classifier_dir)
     model.eval()

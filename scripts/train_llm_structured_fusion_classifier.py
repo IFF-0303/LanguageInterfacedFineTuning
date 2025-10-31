@@ -181,6 +181,16 @@ def parse_args() -> argparse.Namespace:
         default="none",
         help="Strategy for rebalancing class distributions during training.",
     )
+    parser.add_argument(
+        "--disable-ddp-find-unused-parameters",
+        action="store_false",
+        dest="ddp_find_unused_parameters",
+        help=(
+            "Disable DistributedDataParallel unused parameter detection. "
+            "Enable this option if all parameters are guaranteed to receive gradients."
+        ),
+    )
+    parser.set_defaults(ddp_find_unused_parameters=True)
     parser.add_argument("--num-workers", type=int, default=0, help="Number of DataLoader workers.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
 
@@ -732,7 +742,7 @@ def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
             model,
             device_ids=[rank] if device.type == "cuda" else None,
             output_device=rank if device.type == "cuda" else None,
-            find_unused_parameters=False,
+            find_unused_parameters=args.ddp_find_unused_parameters,
         )
 
     train_loader, val_loader, train_sampler = prepare_dataloaders(

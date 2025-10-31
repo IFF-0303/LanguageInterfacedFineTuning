@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import random
+import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -32,6 +33,10 @@ from src.lift.models.gptj.llm_structured_fusion_classifier import (
 )
 from src.lift.models.gptj.samplers import DistributedWeightedRandomSampler
 from src.lift.models.gptj.lora_gptj import LoRaConfigParams
+from scripts.health_csv_utils import load_health_dataset_from_csv
+
+
+TAB_FEATURES_FIELD = "tab_features"
 
 
 def parse_args() -> argparse.Namespace:
@@ -182,36 +187,78 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_examples(file_path: str) -> List[Dict[str, Any]]:
+def load_examples(
+    file_path: str,
+    *,
+    tab_features_field: str = TAB_FEATURES_FIELD,
+    numeric_fields: Optional[Sequence[str]] = None,
+    categorical_fields: Optional[Sequence[str]] = None,
+    require_label: bool = False,
+) -> Tuple[List[Dict[str, Any]], Optional[str], List[str], List[str]]:
     data_path = Path(file_path)
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset file '{file_path}' does not exist.")
 
     if data_path.suffix.lower() == ".csv":
-        import csv
+        (
+            examples,
+            inferred_label_field,
+            feature_columns,
+            csv_categorical_fields,
+        ) = load_health_dataset_from_csv(
+            data_path,
+            tab_features_field=tab_features_field,
+            feature_columns=None,
+            require_label=require_label,
+        )
 
-        with data_path.open("r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = [dict(row) for row in reader]
-        if not rows:
-            raise ValueError(f"CSV dataset '{file_path}' is empty.")
-        return rows
+        categorical_list = (
+            list(categorical_fields)
+            if categorical_fields is not None
+            else list(csv_categorical_fields)
+        )
+        categorical_set = set(categorical_list)
+        numeric_list = (
+            list(numeric_fields)
+            if numeric_fields is not None
+            else [col for col in feature_columns if col not in categorical_set]
+        )
+
+        for example in examples:
+            tab_values = example.get(tab_features_field)
+            if not isinstance(tab_values, (list, tuple)):
+                continue
+            for idx, column in enumerate(feature_columns):
+                if idx >= len(tab_values):
+                    break
+                value = tab_values[idx]
+                if isinstance(value, float) and math.isnan(value):
+                    example[column] = None
+                else:
+                    example[column] = value
+
+        return examples, inferred_label_field, numeric_list, categorical_list
 
     raw_content = data_path.read_text(encoding="utf-8").strip()
     if not raw_content:
         raise ValueError(f"Dataset file '{file_path}' is empty.")
 
     try:
-        return [json.loads(line) for line in raw_content.splitlines() if line.strip()]
+        examples = [json.loads(line) for line in raw_content.splitlines() if line.strip()]
     except json.JSONDecodeError:
         parsed = json.loads(raw_content)
         if isinstance(parsed, dict):
-            return [parsed]
-        if isinstance(parsed, list):
-            return parsed
-        raise ValueError(
-            "Unsupported dataset format: expected a JSON object, list, or newline-delimited entries."
-        )
+            examples = [parsed]
+        elif isinstance(parsed, list):
+            examples = parsed
+        else:
+            raise ValueError(
+                "Unsupported dataset format: expected a JSON object, list, or newline-delimited entries."
+            )
+
+    numeric_list = list(numeric_fields) if numeric_fields is not None else []
+    categorical_list = list(categorical_fields) if categorical_fields is not None else []
+    return examples, None, numeric_list, categorical_list
 
 
 def build_label_mapping(examples: Iterable[Dict[str, Any]], label_field: str | None = None) -> Dict[str, int]:
@@ -578,15 +625,33 @@ def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
     set_seed(args.seed + rank)
 
-    train_examples = load_examples(args.train_file)
-    val_examples = load_examples(args.val_file)
+    (
+        train_examples,
+        inferred_label_field,
+        numeric_fields,
+        categorical_fields,
+    ) = load_examples(
+        args.train_file,
+        tab_features_field=TAB_FEATURES_FIELD,
+        numeric_fields=args.numeric_fields,
+        categorical_fields=args.categorical_fields,
+        require_label=True,
+    )
+    val_examples, _, _, _ = load_examples(
+        args.val_file,
+        tab_features_field=TAB_FEATURES_FIELD,
+        numeric_fields=numeric_fields,
+        categorical_fields=categorical_fields,
+        require_label=True,
+    )
 
     if args.train_backbone and args.train_lora:
         raise ValueError("--train-backbone and --train-lora cannot be enabled together.")
     if args.train_lora and args.no_adapter:
         raise ValueError("--train-lora requires LoRA adapters. Remove --no-adapter to enable them.")
 
-    label2id = build_label_mapping(train_examples, label_field=args.label_field)
+    label_field = args.label_field or inferred_label_field
+    label2id = build_label_mapping(train_examples, label_field=label_field)
     num_labels = len(label2id)
 
     classifier_config = ClassifierHeadConfig(
@@ -596,7 +661,7 @@ def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
     )
 
     structured_config = StructuredEncoderConfig(
-        numeric_feature_dim=len(args.numeric_fields or []),
+        numeric_feature_dim=len(numeric_fields),
         categorical_cardinalities=[],  # Placeholder, updated after dataset construction
         structured_dim=args.structured_dim,
         categorical_embedding_dim=args.categorical_embedding_dim,
@@ -636,9 +701,9 @@ def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
         train_examples=train_examples,
         val_examples=val_examples,
         label2id=label2id,
-        numeric_fields=args.numeric_fields,
-        categorical_fields=args.categorical_fields,
-        label_field=args.label_field,
+        numeric_fields=numeric_fields,
+        categorical_fields=categorical_fields,
+        label_field=label_field,
         max_length=args.max_length,
     )
 
@@ -766,9 +831,9 @@ def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
             "learning_rate": args.learning_rate,
             "backbone_learning_rate": args.backbone_learning_rate,
             "fusion_mode": args.fusion_mode,
-            "numeric_fields": list(args.numeric_fields or []),
-            "categorical_fields": list(args.categorical_fields or []),
-            "label_field": args.label_field,
+            "numeric_fields": list(numeric_fields),
+            "categorical_fields": list(categorical_fields),
+            "label_field": label_field,
         }
     }
     model.save_classifier(output_dir, extra_metadata=extra_metadata)

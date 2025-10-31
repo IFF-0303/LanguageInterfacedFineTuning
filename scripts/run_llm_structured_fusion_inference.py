@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -19,6 +20,10 @@ from src.lift.models.gptj.llm_structured_fusion_classifier import (
     StructuredEncoderConfig,
     StructuredFusionDataset,
 )
+from scripts.health_csv_utils import load_health_dataset_from_csv
+
+
+TAB_FEATURES_FIELD = "tab_features"
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,36 +58,67 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_examples(file_path: str) -> List[Dict[str, Any]]:
+def load_examples(
+    file_path: str,
+    *,
+    numeric_fields: Sequence[str],
+    categorical_fields: Sequence[str],
+    tab_features_field: str = TAB_FEATURES_FIELD,
+    require_label: bool = False,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     data_path = Path(file_path)
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset file '{file_path}' does not exist.")
 
     if data_path.suffix.lower() == ".csv":
-        import csv
+        (
+            examples,
+            inferred_label_field,
+            feature_columns,
+            _,
+        ) = load_health_dataset_from_csv(
+            data_path,
+            tab_features_field=tab_features_field,
+            feature_columns=None,
+            require_label=require_label,
+        )
 
-        with data_path.open("r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = [dict(row) for row in reader]
-        if not rows:
-            raise ValueError(f"CSV dataset '{file_path}' is empty.")
-        return rows
+        column_lookup = {column: idx for idx, column in enumerate(feature_columns)}
+        required_columns = list(dict.fromkeys(list(numeric_fields) + list(categorical_fields)))
+        for example in examples:
+            tab_values = example.get(tab_features_field)
+            if not isinstance(tab_values, (list, tuple)):
+                continue
+            for column in required_columns:
+                idx = column_lookup.get(column)
+                if idx is None or idx >= len(tab_values):
+                    continue
+                value = tab_values[idx]
+                if isinstance(value, float) and math.isnan(value):
+                    example[column] = None
+                else:
+                    example[column] = value
+
+        return examples, inferred_label_field
 
     raw_content = data_path.read_text(encoding="utf-8").strip()
     if not raw_content:
         raise ValueError(f"Dataset file '{file_path}' is empty.")
 
     try:
-        return [json.loads(line) for line in raw_content.splitlines() if line.strip()]
+        examples = [json.loads(line) for line in raw_content.splitlines() if line.strip()]
     except json.JSONDecodeError:
         parsed = json.loads(raw_content)
         if isinstance(parsed, dict):
-            return [parsed]
-        if isinstance(parsed, list):
-            return parsed
-        raise ValueError(
-            "Unsupported dataset format: expected a JSON object, list, or newline-delimited entries."
-        )
+            examples = [parsed]
+        elif isinstance(parsed, list):
+            examples = parsed
+        else:
+            raise ValueError(
+                "Unsupported dataset format: expected a JSON object, list, or newline-delimited entries."
+            )
+
+    return examples, None
 
 
 def build_dataset(
@@ -167,7 +203,16 @@ def main() -> None:
     model.load_classifier(args.classifier_dir)
     model.eval()
 
-    examples = load_examples(args.data_file)
+    require_label = bool(label_field)
+    examples, inferred_label_field = load_examples(
+        args.data_file,
+        numeric_fields=numeric_fields,
+        categorical_fields=categorical_fields,
+        tab_features_field=TAB_FEATURES_FIELD,
+        require_label=require_label,
+    )
+    if not label_field:
+        label_field = inferred_label_field
     dataset = build_dataset(
         examples=examples,
         tokenizer=model.tokenizer,

@@ -31,6 +31,7 @@ from src.lift.models.gptj.llm_structured_fusion_classifier import (
     StructuredFusionHead,
 )
 from src.lift.models.gptj.samplers import DistributedWeightedRandomSampler
+from src.lift.models.gptj.lora_gptj import LoRaConfigParams
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +54,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--adapter-path", help="Optional directory containing pre-trained LoRA adapters.")
     parser.add_argument("--no-adapter", action="store_true", help="Disable LoRA adapters entirely.")
+    parser.add_argument("--lora-r", type=int, default=16, help="LoRA rank when adapters are enabled.")
+    parser.add_argument(
+        "--lora-alpha",
+        type=int,
+        default=32,
+        help="Scaling factor applied within LoRA layers when adapters are enabled.",
+    )
+    parser.add_argument(
+        "--lora-dropout",
+        type=float,
+        default=0.05,
+        help="Dropout probability used by LoRA adapters during training.",
+    )
+    parser.add_argument(
+        "--lora-target-modules",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional explicit module names to wrap with LoRA layers. "
+            "Defaults to attention and MLP projections if omitted."
+        ),
+    )
     parser.add_argument("--load-in-4bit", action="store_true", help="Enable 4-bit quantisation for the backbone.")
     parser.add_argument("--train-backbone", action="store_true", help="Unfreeze the backbone for joint training.")
     parser.add_argument(
@@ -582,6 +605,15 @@ def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
         use_numeric_missing_embeddings=not args.disable_numeric_missing_embeddings,
     )
 
+    lora_config = None
+    if not args.no_adapter:
+        lora_config = LoRaConfigParams(
+            r=args.lora_r,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+            target_modules=args.lora_target_modules or None,
+        )
+
     model = LLMStructuredFusionClassifier(
         num_labels=num_labels,
         classifier_config=classifier_config,
@@ -594,6 +626,7 @@ def train(rank: int, world_size: int, args: argparse.Namespace) -> None:
         adapter_path=args.adapter_path,
         adapter=not args.no_adapter,
         load_in_4bit=args.load_in_4bit,
+        lora_config=lora_config,
     )
 
     model.set_label_mapping(label2id)
